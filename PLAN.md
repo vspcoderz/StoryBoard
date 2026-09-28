@@ -221,10 +221,10 @@ Full scope designed up front, but it still has to be *built* in dependency order
 there is a **hard checkpoint**: the canvas feel is demonstrated, and if the interaction model is wrong
 we change it before layers 4–8 exist to be rewritten.
 
-1. Scaffold — Next 16 + TS + Tailwind 4, PartyKit, TypeScript aliases
-2. Engine foundation — geometry, viewport, render loop, dirty rects, spatial index, input
-3. **✅ CHECKPOINT** — pan/zoom/select/draw/transform working, ugly, on a real URL
-4. Text engine + shapes + sticky + draw (pressure)
+1. Scaffold — Next 16 + TS + Tailwind 4, PartyKit, TypeScript aliases ✅
+2. Engine foundation — geometry, viewport, render loop, dirty rects, spatial index, input ✅
+3. ~~✅ CHECKPOINT~~ — skipped at user's request; combined into steps 1–2 above
+4. Text engine + shapes + sticky + draw (pressure) ✅
 5. Connectors, typed edges, frames, groups, snapping
 6. Yjs document, PartyKit server, presence, undo/redo, share links
 7. Story domain — node types, templates, inspector
@@ -259,4 +259,32 @@ we change it before layers 4–8 exist to be rewritten.
 
 ## Status
 
-Planning. Awaiting build approval.
+**Steps 1, 2, 4 built and verified. Step 6+ not started.**
+
+Done: scaffold, engine foundation (geometry, viewport, render loop with dirty rects, spatial
+index, two-stage hit testing), 9 shape kinds, text layout, sticky notes, pressure-aware freehand,
+pointer state machine with preview-overlay commit, text editing overlay, left tool rail.
+
+Verification at time of writing: `tsc --noEmit` clean, `eslint` clean, 57/57 unit tests passing,
+`next build` succeeds, dev server serves 200 with the full tool rail server-rendered.
+
+**Not yet verified:** no desktop browser was connected to the session, so the canvas has *not* been
+visually confirmed. Everything above is static and server-side proof. The first thing to do on a
+machine with a browser is open it and check that shapes, text and freehand actually paint, then
+measure against the performance budget. Treat "it builds" as "it compiles", not "it works".
+
+## Known gaps, carried forward
+
+- **Undo is snapshot-based.** O(whole scene) per entry, and it cannot distinguish my edits from a
+  collaborator's. Replaced wholesale by `Y.UndoManager` in the collaboration step. Do not build
+  features that depend on it.
+- **Rotation handles are not implemented.** Resize respects rotation, but there is no rotate handle
+  or keyboard rotate yet.
+- **Snapping and alignment guides are not implemented** (planned in step 5).
+- **Connectors, typed edges, frames-as-groups and grouping are not implemented** (step 5).
+- **`npm audit` reports 4 advisories**, all transitive through `partykit` → `miniflare` → `undici`
+  (high) and `partykit` → `esbuild` (moderate). `partykit@0.0.115` is the latest release and
+  `npm audit fix --force` "resolves" it by installing `partykit@0.0.0`, i.e. by deleting the
+  package. Both land in the local dev toolchain, not the browser bundle or the deployed Worker.
+  Accepted and documented; do not run `--force`. Revisit if partykit ships an update.
+
