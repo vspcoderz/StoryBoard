@@ -18,10 +18,8 @@ import { chaikinStroke, strokeOutline } from './draw'
 import { shapePath } from './shapes'
 import type { Ctx2D } from '../text'
 import { baselineOffset, fontString, layoutText } from '../text'
+import { alpha, theme } from '../theme'
 
-const ACCENT = '#4f46e5'
-const BG = '#f7f7fb'
-const GRID = '#d9d9e8'
 const TEXT_PAD = 12
 
 export type RemoteCursor = {
@@ -84,6 +82,7 @@ export class Renderer {
     const ctx = fitCanvas(this.canvas, this.cssW, this.cssH) as CanvasRenderingContext2D
     const { all, rect } = this.store.consumeDirty()
     const vp = this.store.viewport
+    const t = theme()
 
     ctx.save()
     if (!all && rect) {
@@ -94,7 +93,7 @@ export class Renderer {
       ctx.clip()
     }
 
-    ctx.fillStyle = BG
+    ctx.fillStyle = t.sheet
     ctx.fillRect(0, 0, this.cssW, this.cssH)
 
     this.drawGrid(ctx, vp)
@@ -136,7 +135,7 @@ export class Renderer {
     const y0 = Math.floor(view.y / step) * step
     const r = Math.max(0.6, 1.1 * Math.min(vp.scale, 2))
 
-    ctx.fillStyle = GRID
+    ctx.fillStyle = theme().grid
     for (let wx = x0; wx < view.x + view.w; wx += step) {
       for (let wy = y0; wy < view.y + view.h; wy += step) {
         const p = toScreen({ x: wx, y: wy }, vp)
@@ -246,7 +245,7 @@ export class Renderer {
   }
 
   private drawGroupOutline(ctx: Ctx2D, n: GroupNode): void {
-    ctx.strokeStyle = '#9c9ce0'
+    ctx.strokeStyle = theme().graphite
     ctx.lineWidth = 1
     ctx.setLineDash([4, 4])
     ctx.strokeRect(-n.w / 2, -n.h / 2, n.w, n.h)
@@ -326,24 +325,25 @@ export class Renderer {
   // ------------------------------------------------------------ overlays
 
   private drawOverlays(ctx: Ctx2D, vp: { x: number; y: number; scale: number }): void {
+    const t = theme()
     const sel = this.store.selection
     const selRect = this.store.selectionBounds()
 
     if (this.overlay.hoverId && !sel.has(this.overlay.hoverId)) {
       const n = this.store.get(this.overlay.hoverId)
-      if (n) this.ring(ctx, nodeBounds(n), vp, '#b4b4e8', 1)
+      if (n) this.ring(ctx, nodeBounds(n), vp, alpha(t.brass, 0.45), 1.5 / vp.scale)
     }
 
     if (sel.size > 0 && selRect) {
       ctx.save()
-      ctx.strokeStyle = ACCENT
+      ctx.strokeStyle = t.brass
       ctx.lineWidth = 1.5
       // Screen-constant outline. Scaling the stroke with the zoom makes the selection ring vanish
       // when zoomed out, which reads as "the app lost my selection".
       const size = 8
       for (const id of sel) {
         const n = this.store.get(id)
-        if (n) this.ring(ctx, nodeBounds(n), vp, ACCENT, 1.5 / vp.scale)
+        if (n) this.ring(ctx, nodeBounds(n), vp, t.brass, 1.5 / vp.scale)
       }
       // One transform frame around the whole selection.
       const a = toScreen({ x: selRect.x, y: selRect.y }, vp)
@@ -355,8 +355,8 @@ export class Renderer {
         { x: a.x, y: b.y },
       ]
       for (const c of corners) {
-        ctx.fillStyle = '#ffffff'
-        ctx.strokeStyle = ACCENT
+        ctx.fillStyle = t.sheet
+        ctx.strokeStyle = t.brass
         ctx.beginPath()
         ctx.rect(c.x - size / 2, c.y - size / 2, size, size)
         ctx.fill()
@@ -386,7 +386,7 @@ export class Renderer {
       ctx.beginPath()
       ctx.roundRect(p.x + 12, p.y + 10, w + 12, 18, 4)
       ctx.fill()
-      ctx.fillStyle = '#ffffff'
+      ctx.fillStyle = t.sheet
       ctx.fillText(r.name, p.x + 18, p.y + 23)
       ctx.restore()
     }
@@ -396,8 +396,8 @@ export class Renderer {
       const a = toScreen({ x: m.x, y: m.y }, vp)
       const b = toScreen({ x: m.x + m.w, y: m.y + m.h }, vp)
       ctx.save()
-      ctx.fillStyle = 'rgba(79, 70, 229, 0.08)'
-      ctx.strokeStyle = ACCENT
+      ctx.fillStyle = alpha(t.brass, 0.1)
+      ctx.strokeStyle = t.brass
       ctx.lineWidth = 1
       ctx.fillRect(a.x, a.y, b.x - a.x, b.y - a.y)
       ctx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y)

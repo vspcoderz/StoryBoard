@@ -2,25 +2,34 @@
  * Editor orchestrator.
  *
  * Owns the store, the renderer, pointer input, the text overlay and the keyboard map, and is the
- * only thing React talks to. React never reaches into the store mid-frame; it asks for coarse
- * state and subscribes to coarse events.
+ * only thing React talks to. React never reaches into the store mid-frame; it asks for coarse state
+ * and subscribes to coarse events.
  *
- * UNDO IS A KNOWN GAP. It is snapshot-based here so the editor is usable and testable today, and
- * it is replaced wholesale by `Y.UndoManager` in the collaboration step. Snapshot undo has two
- * properties that will not survive: it is O(whole scene) per entry, and it cannot distinguish my
- * edits from a collaborator's, so it would happily undo their work. Do not build features that
- * depend on it — see PLAN.md.
+ * Every mutation goes through one function, `mutate`. That indirection is the whole point: with a
+ * collab bridge attached, `mutate` writes to the CRDT and the store is re-derived from it; without
+ * one, it writes to the store directly. Same call sites either way, so the local-only path cannot
+ * quietly diverge from the collaborative one.
+ *
+ * Undo has two implementations behind one method. With a bridge it is `Y.UndoManager`, which knows
+ * which transactions were mine and will refuse to revert a collaborator's. Without one it falls back
+ * to whole-scene snapshots — correct for a single user, and honest about its limits: it is
+ * O(whole scene) per step and it cannot tell my edits from anyone else's.
  */
 
 import { PointerInput } from './input/pointer'
 import { TextEditor, isTextEditable } from './input/textEditor'
+import { applyMutation, type Mutation } from './mutation'
 import { Renderer, type OverlayState } from './render/renderer'
-import { restore, snapshot } from './serialize'
+import { snapshot, restore } from './serialize'
 import { SceneStore } from './store'
 import { toolByKey, type Tool } from './tools/registry'
 import { makeNode, DEFAULT_STYLE, newId, type BoardNode, type Style } from './types'
 import { rectUnionAll } from './geometry'
-import { zoomAt, type Viewport } from './viewport'
+import { zoomAt, toWorld, type Viewport } from './viewport'
+import { initTheme } from './theme'
+import { YDocBridge, type BridgeStatus } from '../collab/ydoc'
+import { connect as connectCollab, watchStatus } from '../collab/provider'
+import { PresenceChannel } from '../collab/presence'
 
 const HISTORY_LIMIT = 100
 
@@ -28,6 +37,7 @@ export type EditorEvents = {
   tool: (tool: Tool) => void
   selection: (ids: string[]) => void
   stats: (stats: { nodes: number; zoom: number }) => void
+  status: (status: BridgeStatus) => void
 }
 
 export class Editor {
@@ -37,6 +47,8 @@ export class Editor {
   readonly textEditor: TextEditor
 
   private tool: Tool = { kind: 'select' }
+  private mutate: (m: Mutation) => void
+  private bridge: YDocBridge | null = null
   private history: string[] = []
   private future: string[] = []
   private clipboard: BoardNode[] = []
@@ -45,6 +57,7 @@ export class Editor {
     tool: new Set(),
     selection: new Set(),
     stats: new Set(),
+    status: new Set(),
   }
   private disposers: (() => void)[] = []
   private statsTimer: ReturnType<typeof setTimeout> | null = null
@@ -54,6 +67,7 @@ export class Editor {
     private container: HTMLElement,
   ) {
     this.renderer = new Renderer(canvas, this.store)
+    this.mutate = (m) => applyMutation(this.store, m)
 
     this.textEditor = new TextEditor(
       container,
@@ -70,19 +84,34 @@ export class Editor {
       requestRender: () => this.requestRender(),
       beginTextEdit: (id) => this.textEditor.open(id),
       isTextEditing: () => this.textEditor.isOpen,
-      onTransientCommitted: () => this.pushHistory(),
+      commit: (m) => {
+        this.mutate(m)
+        this.afterCommit()
+      },
+      onTransientCommitted: () => this.afterCommit(),
       onTransientDiscarded: () => {},
     })
     this.pointer.onMarquee = (r) => {
       this.overlay.marquee = r
       this.renderer.setOverlay({ marquee: r })
     }
+    // Report my cursor for presence, in world coordinates — the renderer draws remote cursors
+    // through the viewport transform, so a normalised screen position would land somewhere else
+    // entirely for anyone at a different zoom. Throttled downstream, so per-move is safe; a timer
+    // would instead lag visibly behind the real pointer.
+    this.canvas.addEventListener('pointermove', (e) => {
+      const r = this.canvas.getBoundingClientRect()
+      const p = toWorld({ x: e.clientX - r.left, y: e.clientY - r.top }, this.store.viewport)
+      this.reportCursor(p.x, p.y)
+    })
 
     this.disposers.push(
       this.store.on((ev) => {
         if (ev === 'selection') {
           this.selDirty = true
-          for (const fn of this.listeners.selection) fn([...this.store.selection])
+          const ids = [...this.store.selection]
+          this.reportSelection(ids)
+          for (const fn of this.listeners.selection) fn(ids)
         }
         if (ev === 'viewport') {
           this.statsDirty = true
@@ -98,16 +127,33 @@ export class Editor {
     const onKeyUp = (e: KeyboardEvent) => this.onKeyUp(e)
     const onResize = () => this.resize()
     const onFocus = () => this.container.focus()
+    // Space is the pan modifier, and a keyup missed while the window is unfocused leaves it stuck
+    // down — after which *every* drag pans the board and nothing on it can be moved. Losing focus
+    // always releases it.
+    const onBlur = () => this.pointer.setSpaceDown(false)
     window.addEventListener('keydown', onKey)
     window.addEventListener('keyup', onKeyUp)
     window.addEventListener('resize', onResize)
+    window.addEventListener('blur', onBlur)
+    document.addEventListener('visibilitychange', onBlur)
     canvas.addEventListener('pointerdown', onFocus)
     this.disposers.push(() => {
       window.removeEventListener('keydown', onKey)
       window.removeEventListener('keyup', onKeyUp)
       window.removeEventListener('resize', onResize)
+      window.removeEventListener('blur', onBlur)
+      document.removeEventListener('visibilitychange', onBlur)
       canvas.removeEventListener('pointerdown', onFocus)
     })
+
+    // Re-read the palette and repaint when the system appearance flips, so the canvas follows the
+    // system rather than freezing at whatever it saw on first paint.
+    this.disposers.push(
+      initTheme(() => {
+        this.store.markDirty(null)
+        this.requestRender()
+      }),
+    )
 
     this.resize()
   }
@@ -116,6 +162,7 @@ export class Editor {
 
   destroy(): void {
     this.pointer.destroy()
+    this.bridge?.destroy()
     for (const d of this.disposers) d()
     this.disposers = []
     if (this.statsTimer) clearTimeout(this.statsTimer)
@@ -151,9 +198,9 @@ export class Editor {
    * Cached snapshots for `useSyncExternalStore`.
    *
    * React compares snapshots by identity and re-renders forever if `getSnapshot` returns a fresh
-   * object or array on every call. So each of these caches its value and only rebuilds it when the
-   * underlying state actually changed. Returning a stable reference is not an optimisation here —
-   * it is the difference between working and an infinite render loop.
+   * object or array on every call. So each caches its value and only rebuilds when the underlying
+   * state actually changed. A stable reference is not an optimisation here — it is the difference
+   * between working and an infinite render loop.
    */
   private selCache: string[] = []
   private selDirty = true
@@ -176,6 +223,92 @@ export class Editor {
     return this.statsCache
   }
 
+  /** A string, so identity comparison is value comparison — no cache needed. */
+  getStatusSnapshot = (): BridgeStatus => this.connectionStatus
+
+  // ------------------------------------------------------------ collab
+
+  /**
+   * Hand document authority to a CRDT bridge.
+   *
+   * After this call the store is a projection: `mutate` writes to the CRDT and the store re-derives
+   * itself. Undo becomes the bridge's, which is the point — it knows which transactions were mine.
+   */
+  attachBridge(bridge: YDocBridge): void {
+    this.bridge = bridge
+    this.mutate = (m) => bridge.apply(m)
+    bridge.onStatus((s) => {
+      for (const fn of this.listeners.status) fn(s)
+    })
+    for (const fn of this.listeners.status) fn(bridge.status)
+  }
+
+  get connectionStatus(): BridgeStatus {
+    return this.bridge?.status ?? 'disconnected'
+  }
+
+  /**
+   * Connect to a shared board and wire presence. Returns a disposer.
+   *
+   * This lives on the editor rather than in the React component so the whole collab stack has one
+   * owner and one teardown path. A component-level cleanup that half-closes a provider is how you
+   * end up with a socket that outlives the document it was carrying.
+   *
+   * Presence feeds back into the engine in two directions: remote cursors out to the renderer, and
+   * my own cursor and selection up to the awareness channel, so collaborators see me pointing at
+   * things.
+   */
+  attachCollab(
+    boardId: string,
+    token: string | null,
+    onUsers: (users: RemoteUser[]) => void,
+  ): () => void {
+    const { doc, provider } = connectCollab(boardId, token)
+    const bridge = new YDocBridge(this.store, doc)
+    this.attachBridge(bridge)
+
+    const presence = new PresenceChannel(provider.awareness)
+    presence.onChange((users) => {
+      this.setRemote(users)
+      onUsers(users)
+    })
+
+    const stopStatus = watchStatus(provider, (s) => {
+      for (const fn of this.listeners.status) fn(s)
+    })
+
+    this.cursorSink = (x, y) => presence.moveCursor(x, y)
+    this.selectionSink = (ids) => presence.setSelection(ids)
+
+    return () => {
+      this.cursorSink = null
+      this.selectionSink = null
+      stopStatus()
+      presence.destroy()
+      provider.destroy()
+      doc.destroy()
+      bridge.destroy()
+    }
+  }
+
+  /** Called by the pointer layer on every move; presence throttles it. */
+  private cursorSink: ((x: number, y: number) => void) | null = null
+  private selectionSink: ((ids: string[]) => void) | null = null
+
+  reportCursor(x: number, y: number): void {
+    this.cursorSink?.(x, y)
+  }
+
+  reportSelection(ids: string[]): void {
+    this.selectionSink?.(ids)
+  }
+
+  /** Live presence, in the shape the renderer draws. */
+  setRemote(users: RemoteUser[]): void {
+    this.overlay.remote = users
+    this.renderer.setOverlay({ remote: users })
+  }
+
   // ------------------------------------------------------------ tool
 
   getTool(): Tool {
@@ -194,7 +327,7 @@ export class Editor {
   private onTextChange(id: string, text: string): void {
     const n = this.store.get(id)
     if (!isTextEditable(n)) return
-    this.store.update(id, { text } as never)
+    this.mutate({ type: 'update', patches: [[id, { text } as never]] })
     this.textEditor.layout()
   }
 
@@ -205,26 +338,38 @@ export class Editor {
     const n = this.store.get(id)
     if (!isTextEditable(n)) return
     // A text tool click that was never typed into should leave nothing behind. Committing an empty
-    // node is how whiteboards fill up with invisible 1×1 ghosts.
+    // node is how whiteboards fill up with invisible ghosts.
     if (n.text.trim() === '') {
-      this.store.discardTransient([id])
-      if (this.store.selection.has(id)) this.store.clearSelection()
-      this.requestRender()
-      return
+      if (this.store.isTransient(id)) {
+        this.store.discardTransient([id])
+        this.store.clearSelection()
+        this.requestRender()
+        return
+      }
+      this.mutate({ type: 'remove', ids: [id] })
+      this.afterCommit()
     }
-    this.store.commitTransient([id])
-    this.pushHistory()
   }
 
-  // ------------------------------------------------------------ commands
+  // ------------------------------------------------------------ undo
 
   private pushHistory(): void {
+    if (this.bridge) return // the CRDT's UndoManager keeps its own stack
     this.history.push(snapshot(this.store))
     if (this.history.length > HISTORY_LIMIT) this.history.shift()
     this.future = []
   }
 
+  /** Called after a local gesture commits. */
+  private afterCommit(): void {
+    this.pushHistory()
+  }
+
   undo(): void {
+    if (this.bridge) {
+      this.bridge.undo()
+      return
+    }
     const prev = this.history.pop()
     if (!prev) return
     this.future.push(snapshot(this.store))
@@ -233,6 +378,10 @@ export class Editor {
   }
 
   redo(): void {
+    if (this.bridge) {
+      this.bridge.redo()
+      return
+    }
     const next = this.future.pop()
     if (!next) return
     this.history.push(snapshot(this.store))
@@ -240,11 +389,21 @@ export class Editor {
     this.requestRender()
   }
 
+  get canUndo(): boolean {
+    return this.bridge ? this.bridge.canUndo : this.history.length > 0
+  }
+
+  get canRedo(): boolean {
+    return this.bridge ? this.bridge.canRedo : this.future.length > 0
+  }
+
+  // ------------------------------------------------------------ commands
+
   deleteSelection(): void {
     const ids = [...this.store.selection]
     if (ids.length === 0) return
     this.pushHistory()
-    this.store.remove(ids)
+    this.mutate({ type: 'remove', ids })
     for (const fn of this.listeners.selection) fn([])
   }
 
@@ -253,8 +412,7 @@ export class Editor {
   }
 
   copy(): void {
-    const ids = [...this.store.selection]
-    this.clipboard = ids
+    this.clipboard = [...this.store.selection]
       .map((id) => this.store.raw(id))
       .filter((n): n is BoardNode => !!n)
       .map((n) => structuredClone(n))
@@ -276,7 +434,7 @@ export class Editor {
       y: n.y + offset,
       z: z++,
     }))
-    this.store.addMany(clones)
+    this.mutate({ type: 'create', nodes: clones })
     this.store.select(clones.map((c) => c.id))
     for (const fn of this.listeners.selection) fn(clones.map((c) => c.id))
   }
@@ -290,12 +448,19 @@ export class Editor {
     const ids = [...this.store.selection]
     if (ids.length === 0) return
     this.pushHistory()
-    this.store.updateMany(
-      ids.map((id) => {
+    this.mutate({
+      type: 'update',
+      patches: ids.map((id) => {
         const b = this.store.getBounds(id)
         return [id, { x: (b?.x ?? 0) + dx, y: (b?.y ?? 0) + dy }] as const
-      }),
-    )
+      }) as [string, never][],
+    })
+  }
+
+  /** Apply a patch from outside — the inspector, or a collaborator-aware command. */
+  patch(id: string, p: Record<string, unknown>): void {
+    this.pushHistory()
+    this.mutate({ type: 'update', patches: [[id, p as never]] })
   }
 
   // ------------------------------------------------------------ viewport
@@ -341,8 +506,7 @@ export class Editor {
   }
 
   private onKeyDown = (e: KeyboardEvent): void => {
-    // Never steal keys from a text field. The overlay stops propagation, but a stray guard here
-    // means an input rendered outside the canvas cannot be broken by a global shortcut.
+    // Never steal keys from a text field.
     const t = e.target as HTMLElement | null
     if (t && (t.isContentEditable || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return
 
@@ -433,69 +597,80 @@ export class Editor {
     }
 
     const def = toolByKey(key)
-    if (def && !e.altKey) {
-      this.setTool(def.tool)
-    }
+    if (def && !e.altKey) this.setTool(def.tool)
   }
 
-  // ------------------------------------------------------------ misc
+  // ------------------------------------------------------------ sample
 
   /** Seed the board so an empty canvas never greets anyone. */
   seedSample(): void {
+    if (this.store.size > 0) return
     const z0 = this.store.nextZ()
     const style = (over: Partial<Style>): Style => ({ ...DEFAULT_STYLE, ...over })
-    this.store.addMany([
-      makeNode({
-        type: 'frame',
-        title: 'Act I — Setup',
-        x: -40,
-        y: -40,
-        w: 720,
-        h: 460,
-        z: z0,
-        style: style({ fill: 'rgba(238,242,255,0.7)', stroke: '#a5a5c8', color: '#4f46e5' }),
-      }),
-      makeNode({
-        type: 'shape',
-        shape: 'rect',
-        text: 'The inciting incident',
-        x: 40,
-        y: 40,
-        w: 260,
-        h: 130,
-        z: z0 + 1,
-        style: style({ fill: '#e8e6ff', stroke: '#4f46e5' }),
-      }),
-      makeNode({
-        type: 'shape',
-        shape: 'diamond',
-        text: 'Will she go back?',
-        x: 400,
-        y: 40,
-        w: 240,
-        h: 130,
-        z: z0 + 2,
-        style: style({ fill: '#fde68a', stroke: '#d97706', color: '#422006' }),
-      }),
-      makeNode({
-        type: 'sticky',
-        text: 'Midpoint reversal — she finds the letter',
-        author: null,
-        x: 120,
-        y: 250,
-        w: 200,
-        h: 160,
-        z: z0 + 3,
-        style: style({
-          fill: '#bbf7d0',
-          stroke: '#15803d',
-          color: '#052e16',
-          align: 'left',
-          valign: 'top',
-          radius: 4,
-          strokeWidth: 1,
+    this.mutate({
+      type: 'create',
+      nodes: [
+        makeNode({
+          type: 'frame',
+          title: 'Act I — Setup',
+          x: -40,
+          y: -40,
+          w: 720,
+          h: 460,
+          z: z0,
+          style: style({ fill: 'rgba(238,242,255,0.7)', stroke: '#a5a5c8', color: '#4f46e5' }),
         }),
-      }),
-    ])
+        makeNode({
+          type: 'shape',
+          shape: 'rect',
+          text: 'The inciting incident',
+          x: 40,
+          y: 40,
+          w: 260,
+          h: 130,
+          z: z0 + 1,
+          style: style({ fill: '#e8e6ff', stroke: '#4f46e5' }),
+        }),
+        makeNode({
+          type: 'shape',
+          shape: 'diamond',
+          text: 'Will she go back?',
+          x: 400,
+          y: 40,
+          w: 240,
+          h: 130,
+          z: z0 + 2,
+          style: style({ fill: '#fde68a', stroke: '#d97706', color: '#422006' }),
+        }),
+        makeNode({
+          type: 'sticky',
+          text: 'Midpoint reversal — she finds the letter',
+          author: null,
+          x: 120,
+          y: 250,
+          w: 200,
+          h: 160,
+          z: z0 + 3,
+          style: style({
+            fill: '#bbf7d0',
+            stroke: '#15803d',
+            color: '#052e16',
+            align: 'left',
+            valign: 'top',
+            radius: 4,
+            strokeWidth: 1,
+          }),
+        }),
+      ],
+    })
   }
+}
+
+export type RemoteUser = {
+  id: string
+  name: string
+  color: string
+  x: number
+  y: number
+  selection: string[]
 }

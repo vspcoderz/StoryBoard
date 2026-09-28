@@ -65,6 +65,41 @@ describe('preview overlay — the collaboration commit rule', () => {
     s.cancelPreview()
     assert.equal(s.pick({ x: 5050, y: 50 }), null)
   })
+  it('rejects a preview that was never begun', () => {
+    const s = new SceneStore()
+    const n = shape(0, 0)
+    s.add(n)
+    // Regression guard. A missing beginPreview once made every drag a silent no-op, disabling move,
+    // resize, drag-to-draw and freehand simultaneously while the UI still looked correct. Failing
+    // loudly is the only way that bug can never ship again.
+    assert.throws(() => s.setPreview(n.id, { x: 10 }), /no active preview/)
+  })
+
+  it('moves a node across a whole preview-then-commit cycle', () => {
+    const s = new SceneStore()
+    const n = shape(0, 0)
+    s.add(n)
+
+    s.beginPreview()
+    s.setPreview(n.id, { x: 40, y: 25 })
+    s.setPreview(n.id, { x: 120 })
+    s.updateMany(s.endPreview())
+
+    assert.equal(s.raw(n.id)!.x, 120)
+    assert.equal(s.raw(n.id)!.y, 25)
+    assert.deepEqual(s.getBounds(n.id), { x: 120, y: 25, w: 100, h: 100 })
+  })
+
+  it('reverts cleanly when a preview is cancelled', () => {
+    const s = new SceneStore()
+    const n = shape(10, 10)
+    s.add(n)
+    s.beginPreview()
+    s.setPreview(n.id, { x: 999 })
+    s.cancelPreview()
+    assert.equal(s.get(n.id)!.x, 10)
+    assert.equal(s.pick({ x: 60, y: 60 }), n.id, 'index must be restored to committed geometry')
+  })
 })
 
 describe('transient nodes', () => {

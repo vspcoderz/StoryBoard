@@ -303,7 +303,13 @@ export class SceneStore {
   }
 
   setPreview(id: string, patch: NodePatch): void {
-    if (!this.preview) return
+    // Throwing rather than returning silently. This exact silent no-op shipped once and took out
+    // move, resize, drag-to-draw and freehand all at the same time, because the pointer layer never
+    // called `beginPreview` and every `setPreview` quietly did nothing. A missing begin is a
+    // programming error, so it should crash at once and say why, not disable half the editor.
+    if (!this.preview) {
+      throw new Error('setPreview called with no active preview — call beginPreview() first')
+    }
     const n = this.nodes.get(id)
     if (!n) return
     this.preview.set(id, { ...this.preview.get(id), ...patch })

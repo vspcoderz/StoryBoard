@@ -1,5 +1,10 @@
+import { ErrorBoundary } from '@/board/ErrorBoundary'
 import { BoardView } from '@/board/BoardView'
 
 export default function Page() {
-  return <BoardView />
+  return (
+    <ErrorBoundary>
+      <BoardView />
+    </ErrorBoundary>
+  )
 }

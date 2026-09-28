@@ -1,26 +1,169 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/*
+ * Design system — "writing desk".
+ *
+ * The subject is story craft: manuscripts, index cards, ink, marginalia. So the chrome is meant to
+ * recede like a desk and the canvas to read like a sheet on it. Chrome carries almost no colour;
+ * the canvas and the story objects carry all of it.
+ *
+ * Two rules govern this file, both from the accessibility guidance:
+ *
+ * 1. Semantic colour. Each token has ONE job. `--brass` means "this is the active thing" and nothing
+ *    else — which is why the plot-thread colour is a separate token and *not* a tint of brass.
+ *    Reusing one hue for two meanings is how a UI stops making sense.
+ * 2. Appearance follows the system. There is deliberately no in-app theme switch. An app-specific
+ *    appearance setting means adjusting two settings to get one result, and people conclude the app
+ *    is broken when it ignores the system one.
+ *
+ * Every text pair below is verified against WCAG in test/contrast.test.ts, so the palette cannot
+ * silently regress.
+ */
+
+@theme {
+  --color-desk: #e8eaee;
+  --color-sheet: #f6f7f9;
+  --color-surface: #ffffff;
+  --color-surface-raised: #fdfdfe;
+
+  --color-ink: #15171c;
+  --color-graphite: #5c6270;
+  --color-quiet: #8b91a0;
+
+  --color-line: #c9cdd6;
+  --color-line-soft: #dfe2e8;
+
+  /* Selection, active tool, focus ring. Reserved. */
+  --color-brass: #a9741a;
+  --color-brass-ink: #7a5410;
+  --color-brass-wash: #f6efe1;
+
+  --color-vermilion: #c2410c;
+  --color-vermilion-wash: #fdefe7;
+
+  --color-grid: #d4d8e0;
+
+  /* Story semantics. Distinct luminance, so they survive colour-vision deficiency. */
+  --color-beat: #7a5119;
+  --color-turning: #822944;
+  --color-character: #0d3c37;
+  --color-location: #8748b6;
+  --color-thread: #4070bd;
+
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  /* Prose on the canvas is serif: it is manuscript text, not interface text. */
+  --font-serif: ui-serif, Georgia, "Iowan Old Style", "Palatino Linotype", "Times New Roman", serif;
+
+  --radius-panel: 10px;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
+/*
+ * Dark values. Base and elevated are deliberately not inversions: the desk recedes, the sheet sits
+ * above it, and panels sit above that. Three distinguishable planes of depth.
+ */
 @media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+  @theme {
+    --color-desk: #15171b;
+    --color-sheet: #1d2025;
+    --color-surface: #23262c;
+    --color-surface-raised: #2a2e35;
+
+    --color-ink: #e9ebef;
+    --color-graphite: #98a0ae;
+    --color-quiet: #767e8c;
+
+    --color-line: #343942;
+    --color-line-soft: #2a2e35;
+
+    --color-brass: #d9a441;
+    --color-brass-ink: #d9a441;
+    --color-brass-wash: #2a2418;
+
+    --color-vermilion: #f97316;
+    --color-vermilion-wash: #2d1c12;
+
+    --color-grid: #2a2e35;
+
+    --color-beat: #f4c786;
+    --color-turning: #fca1bd;
+    --color-character: #6db7ad;
+    --color-location: #fcccff;
+    --color-thread: #c5f1ff;
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer base {
+  html,
+  body,
+  #__next {
+    height: 100%;
+  }
+
+  body {
+    background: var(--color-desk);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    /* Desktop minimum body size is 13px; chrome never goes below it. */
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior: none;
+  }
+
+  /*
+   * Focus is never removed, only restyled. Keyboard users must always be able to see where they
+   * are, and the brass ring is our one loud colour — which is exactly what a focus indicator is for.
+   */
+  :focus-visible {
+    outline: 2px solid var(--color-brass);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* Pointer users do not get a ring; keyboard users always do. */
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+
+  ::selection {
+    background: var(--color-brass-wash);
+    color: var(--color-brass-ink);
+  }
+}
+
+@layer components {
+  /*
+   * Panel material. Translucency only on neutral surfaces — the guidance is explicit that a
+   * surface already using colour to signal state must stay opaque, or its meaning shifts as the
+   * content behind it changes.
+   */
+  .material {
+    background: color-mix(in srgb, var(--color-surface) 82%, transparent);
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+  }
+
+  /*
+   * Reduce Transparency. Backdrop blur is the single most common accessibility complaint about
+   * glassy interfaces, and this is the escape hatch.
+   */
+  @media (prefers-reduced-transparency: reduce) {
+    .material {
+      background: var(--color-surface);
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+    }
+  }
+}
+
+/* Motion answers an action or it does not happen. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

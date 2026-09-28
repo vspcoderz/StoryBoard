@@ -17,6 +17,7 @@ import type { SceneStore } from '../store'
 import { makeNode } from '../types'
 import type { Tool } from '../tools/registry'
 import { createNode, styleFor, toolDef } from '../tools/registry'
+import type { Mutation } from '../mutation'
 import { type HandleId, handleAt, remapRect, resizeRect, resizeRotated } from '../transform'
 import { panBy, toScreen, toWorld, zoomAt } from '../viewport'
 import { StrokeCapture } from './stroke'
@@ -47,6 +48,12 @@ export interface PointerHost {
   requestRender(): void
   beginTextEdit(id: string): void
   isTextEditing(): boolean
+  /**
+   * The single write path. Every committed gesture goes through here rather than touching the store
+   * directly, because the store is a projection of the CRDT when one is attached — a direct write
+   * would render locally and then be overwritten by the next transaction, reaching nobody.
+   */
+  commit(m: Mutation): void
   onTransientCommitted(ids: string[]): void
   onTransientDiscarded(ids: string[]): void
 }
@@ -75,7 +82,7 @@ export class PointerInput {
     on('pointerdown', this.onDown)
     on('pointermove', this.onMove)
     on('pointerup', this.onUp)
-    on('pointercancel', this.onUp)
+    on('pointercancel', this.onCancel)
     on('dblclick', this.onDoubleClick)
     on('wheel', this.onWheel, { passive: false })
     on('contextmenu', this.onContextMenu)
@@ -148,6 +155,7 @@ export class PointerInput {
         style: styleFor(tool),
       })
       store.addTransient(node)
+      store.beginPreview()
       this.state = { kind: 'draw', capture, nodeId: node.id }
       this.host.requestRender()
       return
@@ -157,6 +165,7 @@ export class PointerInput {
       const node = createNode(tool, { x: world.x, y: world.y, w: 1, h: 1 }, store.nextZ())
       if (!node) return
       store.addTransient(node)
+      store.beginPreview()
       this.state = { kind: 'create', start: world, nodeId: node.id, tool, moved: false }
       if (tool.kind === 'text' || tool.kind === 'sticky') {
         // Open the editor immediately. Requiring a second click to start typing is the kind of
@@ -173,6 +182,7 @@ export class PointerInput {
       const h = handleAt(selBox, this.local(e), HANDLE_TOL)
       if (h) {
         const ids = [...store.selection]
+        store.beginPreview()
         this.state = {
           kind: 'resize',
           handle: h.id,
@@ -198,6 +208,7 @@ export class PointerInput {
         store.select([hit])
         ids = [hit]
       }
+      store.beginPreview()
       this.state = {
         kind: 'move',
         start: world,
@@ -325,7 +336,18 @@ export class PointerInput {
 
   // ------------------------------------------------------------ up
 
-  private onUp = (e: PointerEvent): void => {
+  private onUp = (e: PointerEvent): void => this.finish(e, false)
+
+  /**
+   * A cancelled pointer is not a completed one.
+   *
+   * The browser fires `pointercancel` when it takes the gesture away — a palm rejection on touch, a
+   * system gesture, the window losing the pointer. Committing there would drop a half-drawn shape
+   * onto the board that the user never finished.
+   */
+  private onCancel = (e: PointerEvent): void => this.finish(e, true)
+
+  private finish(e: PointerEvent, cancelled: boolean): void {
     if (e.pointerId !== this.activePointer) return
     this.activePointer = null
     if (this.el.hasPointerCapture(e.pointerId)) this.el.releasePointerCapture(e.pointerId)
@@ -337,47 +359,65 @@ export class PointerInput {
     this.updateCursor()
 
     switch (s.kind) {
-      case 'move': {
-        // One write, on release. Not one per pointermove.
-        store.updateMany(store.endPreview())
-        return
-      }
+      case 'move':
       case 'resize': {
-        store.updateMany(store.endPreview())
+        // One write, on release. Not one per pointermove.
+        const patches = cancelled ? (store.cancelPreview(), []) : store.endPreview()
+        this.host.commit({ type: 'update', patches })
         return
       }
       case 'create': {
+        if (cancelled) {
+          store.cancelPreview()
+          store.discardTransient([s.nodeId])
+          return
+        }
+        const node = store.get(s.nodeId)
+        if (!node) return
+        let final = node
         if (!s.moved) {
           // A click, not a drag: place at the tool's default size so a quick tap still gives you
           // a sensibly sized shape instead of a 1×1 speck. Centred on the click rather than hung
           // off its top-left, so the shape appears under the cursor where you actually aimed.
           const def = toolDef(s.tool)
-          store.cancelPreview()
-          store.update(s.nodeId, {
+          final = {
+            ...node,
             x: s.start.x - def.size.w / 2,
             y: s.start.y - def.size.h / 2,
             w: def.size.w,
             h: def.size.h,
-          })
-        } else {
-          store.updateMany(store.endPreview())
+          }
         }
-        const committed = store.commitTransient([s.nodeId])
-        this.host.onTransientCommitted(committed)
-        store.select([s.nodeId])
+        store.endPreview()
+        store.discardTransient([s.nodeId])
+        // Committed as a create, never as an update. The node was transient, so it is not in the
+        // CRDT yet; patching an id the document has never seen is silently a no-op, and the shape
+        // would arrive at every collaborator as a 1x1 speck.
+        this.host.commit({ type: 'create', nodes: [final] })
+        this.host.onTransientCommitted([final.id])
+        store.select([final.id])
         this.host.setTool({ kind: 'select' })
         return
       }
       case 'draw': {
-        if (s.capture.length < 2) {
-          // A tap with the draw tool: a single dot. Keep it, it is a legitimate mark.
-          const f = s.capture.finish()
-          store.update(s.nodeId, f)
-        } else {
-          store.updateMany(store.endPreview())
+        if (cancelled) {
+          store.cancelPreview()
+          store.discardTransient([s.nodeId])
+          return
         }
-        const committed = store.commitTransient([s.nodeId])
-        this.host.onTransientCommitted(committed)
+        const node = store.get(s.nodeId)
+        if (!node) return
+        let final = node
+        if (s.capture.length < 2) {
+          // A tap with the draw tool is a single dot. Legitimate, so keep it.
+          final = { ...node, ...s.capture.finish() }
+        } else {
+          final = { ...node, ...s.capture.finish() }
+        }
+        store.endPreview()
+        store.discardTransient([s.nodeId])
+        this.host.commit({ type: 'create', nodes: [final] })
+        this.host.onTransientCommitted([final.id])
         this.host.setTool({ kind: 'select' })
         return
       }
