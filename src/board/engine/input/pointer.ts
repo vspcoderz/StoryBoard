@@ -13,6 +13,8 @@
 
 import type { Rect, Vec } from '../geometry'
 import { rectFromDrag } from '../geometry'
+import { anchorFor, bestSide } from '../connector'
+import type { Guide } from '../snap'
 import type { SceneStore } from '../store'
 import { makeNode } from '../types'
 import type { Tool } from '../tools/registry'
@@ -25,6 +27,30 @@ import { StrokeCapture } from './stroke'
 /** Screen-pixel slop below which a drag counts as a click, not a resize or a box draw. */
 const CLICK_SLOP = 4
 const HANDLE_TOL = 7
+
+/** Union of the original rects of a multi-node drag — the box that gets snapped as a unit. */
+function unionOf(origin: Map<string, Rect>): Rect {
+  const rects = [...origin.values()]
+  let x = Infinity
+  let y = Infinity
+  let r = -Infinity
+  let b = -Infinity
+  for (const q of rects) {
+    x = Math.min(x, q.x)
+    y = Math.min(y, q.y)
+    r = Math.max(r, q.x + q.w)
+    b = Math.max(b, q.y + q.h)
+  }
+  if (rects.length === 0) return { x: 0, y: 0, w: 0, h: 0 }
+  return { x, y, w: r - x, h: b - y }
+}
+
+/** World position of one end of a connector, for deciding which side a re-bind should use. */
+function worldOf(connectorId: string, store: SceneStore, end: 'from' | 'to'): Vec {
+  const pts = store.connectorPath(connectorId)
+  if (pts.length === 0) return { x: 0, y: 0 }
+  return end === 'from' ? pts[0] : pts[pts.length - 1]
+}
 
 type Interaction =
   | { kind: 'idle' }
@@ -40,6 +66,28 @@ type Interaction =
     }
   | { kind: 'create'; start: Vec; nodeId: string; tool: Tool; moved: boolean }
   | { kind: 'draw'; capture: StrokeCapture; nodeId: string }
+  /**
+   * Dragging out a connector.
+   *
+   * `fromId` is the node the line started on (null when started on empty canvas), and `toId` is
+   * whatever is under the cursor *now*. The connector is transient and unbound at the ends until
+   * release, so a half-drawn connector costs zero CRDT writes — same rule as every other gesture.
+   */
+  | {
+      kind: 'connector'
+      start: Vec
+      nodeId: string
+      fromId: string | null
+      toId: string | null
+    }
+  /**
+   * Dragging one end of an existing connector to re-aim or re-bind it.
+   *
+   * Separate from `connector` because the commit differs: a new connector is a create, this is an
+   * update of two fields. Conflating them would make dragging an endpoint look like it duplicated
+   * the line.
+   */
+  | { kind: 'connectorEnd'; connectorId: string; end: 'from' | 'to'; start: Vec }
 
 export interface PointerHost {
   store: SceneStore
@@ -56,6 +104,10 @@ export interface PointerHost {
   commit(m: Mutation): void
   onTransientCommitted(ids: string[]): void
   onTransientDiscarded(ids: string[]): void
+  /** Alignment guides to draw for the gesture in flight. */
+  setGuides(guides: Guide[]): void
+  /** The route of a connector currently being dragged out, for the pending preview. */
+  onPendingConnector(pts: Vec[] | null): void
 }
 
 export class PointerInput {
@@ -139,6 +191,38 @@ export class PointerInput {
       return
     }
 
+    // The connector tool grabs whatever is under the cursor and drags a line from it. Started on
+    // empty canvas it still works — it just starts unbound, which is how you draw a free line.
+    if (tool.kind === 'connector') {
+      const hit = store.pickExact(world, this.tolerance())
+      const fromId = hit && store.get(hit)?.type !== 'connector' ? hit : null
+      const node = makeNode({
+        type: 'connector',
+        fromId,
+        toId: null,
+        fromSide: null,
+        toSide: null,
+        startArrow: false,
+        endArrow: true,
+        route: 'orthogonal',
+        label: '',
+        edgeKind: null,
+        // Bounds are meaningless for a connector — the store keeps them as the route's bounding box
+        // so the spatial index can still cull it. Seeded at the pointer so the initial query works.
+        x: world.x,
+        y: world.y,
+        w: 1,
+        h: 1,
+        z: store.nextZ(),
+        style: styleFor(tool),
+      })
+      store.addTransient(node)
+      store.beginPreview()
+      this.state = { kind: 'connector', start: world, nodeId: node.id, fromId, toId: null }
+      this.host.requestRender()
+      return
+    }
+
     if (tool.kind === 'draw') {
       const capture = new StrokeCapture()
       capture.add(world, e.pointerType, e.pressure)
@@ -179,8 +263,23 @@ export class PointerInput {
     // Select tool.
     const selBox = this.selectionScreenBox()
     if (selBox && store.selection.size > 0) {
+      // A connector's ends are grabbable well before its line is. Thin-line picking alone makes
+      // re-aiming an arrow almost impossible, which is the whole point of having endpoints.
+      const grabbedEnd = this.connectorEndAt(world, store, e.shiftKey)
+      if (grabbedEnd) {
+        store.beginPreview()
+        this.state = {
+          kind: 'connectorEnd',
+          connectorId: grabbedEnd.connectorId,
+          end: grabbedEnd.end,
+          start: world,
+        }
+        return
+      }
       const h = handleAt(selBox, this.local(e), HANDLE_TOL)
-      if (h) {
+      // A connector's handles are not drawn, and must not be grabbable either: a resize would be
+      // reverted the moment the route is re-derived, which looks like the app ignoring you.
+      if (h && !this.onlyConnectorsSelected(store)) {
         const ids = [...store.selection]
         store.beginPreview()
         this.state = {
@@ -239,6 +338,7 @@ export class PointerInput {
       const nextHover = tool.kind === 'select' ? store.pickExact(world, this.tolerance()) : null
       if (nextHover !== this.hoverId) {
         this.hoverId = nextHover
+        this.onHover(nextHover)
         this.host.requestRender()
       }
       const box = this.selectionScreenBox()
@@ -260,7 +360,6 @@ export class PointerInput {
       }
       case 'marquee': {
         const r = rectFromDrag(s.start, world)
-        this.host.requestRender()
         this.setMarquee(r)
         const inside = store.inRect(r)
         store.select(s.additive ? [...new Set([...s.base, ...inside])] : inside)
@@ -270,8 +369,17 @@ export class PointerInput {
         const dx = world.x - s.start.x
         const dy = world.y - s.start.y
         if (!s.moved && Math.hypot(dx, dy) < CLICK_SLOP / store.viewport.scale) return
-        for (const [id, r] of s.origin) store.setPreview(id, { x: r.x + dx, y: r.y + dy })
+        // Snap the whole selection as one box, not each node separately. Snapping per node would let
+        // members of a group pull against each other and tear the selection apart.
+        const raw = unionOf(s.origin)
+        const moved = { ...raw, x: raw.x + dx, y: raw.y + dy }
+        const snapped = store.snap(moved, s.origin.keys(), store.viewport.scale)
+        this.host.setGuides(snapped.guides)
+        const ax = snapped.rect.x - raw.x
+        const ay = snapped.rect.y - raw.y
+        for (const [id, r] of s.origin) store.setPreview(id, { x: r.x + dx + ax, y: r.y + dy + ay })
         this.state = { ...s, moved: true }
+        this.host.requestRender()
         return
       }
       case 'resize': {
@@ -301,9 +409,104 @@ export class PointerInput {
         store.setPreview(s.nodeId, f)
         return
       }
+      case 'connector': {
+        // Re-resolve the far end every frame so the preview tracks whatever is under the cursor,
+        // including grabbing a node that was not there when the drag started.
+        const over = store.pickExact(world, this.tolerance())
+        const toId = over && over !== s.fromId && store.get(over)?.type !== 'connector' ? over : null
+        if (toId !== s.toId) this.state = { ...s, toId }
+        this.host.onPendingConnector(this.pendingRoute(s, world))
+        this.host.requestRender()
+        return
+      }
+      case 'connectorEnd': {
+        const over = store.pickExact(world, this.tolerance())
+        const c = store.get(s.connectorId)
+        if (!c || c.type !== 'connector') return
+        const otherId = s.end === 'from' ? c.toId : c.fromId
+        const targetId = over && over !== otherId && over !== s.connectorId ? over : null
+        if (targetId) {
+          // Dropping onto a node re-binds it and pins the side, so the arrow stays put even if the
+          // node later moves. Dropping on empty canvas unpins and lets the route float.
+          const targetBounds = store.getBounds(targetId)
+          const side = targetBounds
+            ? bestSide(targetBounds, worldOf(s.connectorId, store, s.end))
+            : null
+          store.setPreview(
+            s.connectorId,
+            s.end === 'from'
+              ? { fromId: targetId, fromSide: side }
+              : { toId: targetId, toSide: side },
+          )
+        } else {
+          store.setPreview(s.connectorId, s.end === 'from' ? { fromId: null, fromSide: null } : { toId: null, toSide: null })
+        }
+        this.host.requestRender()
+        return
+      }
       case 'idle':
         return
     }
+  }
+
+  /** Is the whole selection connectors? Such a selection has no meaningful resize gesture. */
+  private onlyConnectorsSelected(store: SceneStore): boolean {
+    if (store.selection.size === 0) return false
+    for (const id of store.selection) {
+      if (store.get(id)?.type !== 'connector') return false
+    }
+    return true
+  }
+
+  /**
+   * The dashed route shown while dragging a connector out.
+   *
+   * When the far end is over a real node we route against that node, so the preview is exactly the
+   * line you will get. When it is over empty canvas we draw a straight hint to the cursor — there is
+   * nothing to route against yet, and a fake elbow to nowhere would imply a binding that is not
+   * there. The store's connectorPath cannot help here because the far end is not yet a node.
+   */
+  private pendingRoute(s: Extract<Interaction, { kind: 'connector' }>, world: Vec): Vec[] {
+    const store = this.host.store
+    if (!s.fromId) return [s.start, world]
+    const fromBounds = store.getBounds(s.fromId)
+    if (!fromBounds) return [s.start, world]
+    const fromSide = bestSide(fromBounds, world)
+    const from = anchorFor(fromBounds, fromSide)
+    return [from.point, world]
+  }
+
+  /**
+   * Which connector end, if any, is under the pointer.
+   *
+   * Only considers the *selected* connectors when a selection exists, because grabbing a line you
+   * have not selected is disorienting — you click near an arrow belonging to something else and
+   * start dragging it. With no selection, all connectors are fair game, since there is no ambiguity
+   * about what you meant.
+   *
+   * Requires both ends bound: an unbound end has no fixed position to grab.
+   */
+  private connectorEndAt(
+    world: Vec,
+    store: SceneStore,
+    additive: boolean,
+  ): { connectorId: string; end: 'from' | 'to' } | null {
+    const tol = this.tolerance() * 1.5
+    const pool =
+      store.selection.size > 0 && !additive ? [...store.selection] : store.connectorIds()
+    let best: { connectorId: string; end: 'from' | 'to'; d: number } | null = null
+    for (const id of pool) {
+      const c = store.get(id)
+      if (!c || c.type !== 'connector' || !c.fromId || !c.toId) continue
+      const pts = store.connectorPath(id)
+      if (pts.length < 2) continue
+      for (const end of ['from', 'to'] as const) {
+        const p = end === 'from' ? pts[0] : pts[pts.length - 1]
+        const d = Math.hypot(p.x - world.x, p.y - world.y)
+        if (d <= tol && (!best || d < best.d)) best = { connectorId: id, end, d }
+      }
+    }
+    return best ? { connectorId: best.connectorId, end: best.end } : null
   }
 
   private applyResize(
@@ -347,6 +550,18 @@ export class PointerInput {
    */
   private onCancel = (e: PointerEvent): void => this.finish(e, true)
 
+  /** Called on Escape and on window blur, so a gesture can never get stuck in flight. */
+  abort(): void {
+    if (this.state.kind === 'idle') return
+    this.state = { kind: 'idle' }
+    this.host.setGuides([])
+    this.host.onPendingConnector(null)
+    this.host.store.cancelPreview()
+    this.host.setTool({ kind: 'select' })
+    this.updateCursor()
+    this.host.requestRender()
+  }
+
   private finish(e: PointerEvent, cancelled: boolean): void {
     if (e.pointerId !== this.activePointer) return
     this.activePointer = null
@@ -361,6 +576,9 @@ export class PointerInput {
     switch (s.kind) {
       case 'move':
       case 'resize': {
+        // Guides belong to the gesture, so they go when it does. Left up, the board would keep
+        // showing alignment lines for a drag that finished seconds ago.
+        this.host.setGuides([])
         // One write, on release. Not one per pointermove.
         const patches = cancelled ? (store.cancelPreview(), []) : store.endPreview()
         this.host.commit({ type: 'update', patches })
@@ -407,18 +625,43 @@ export class PointerInput {
         }
         const node = store.get(s.nodeId)
         if (!node) return
-        let final = node
-        if (s.capture.length < 2) {
-          // A tap with the draw tool is a single dot. Legitimate, so keep it.
-          final = { ...node, ...s.capture.finish() }
-        } else {
-          final = { ...node, ...s.capture.finish() }
-        }
+        const final = { ...node, ...s.capture.finish() }
         store.endPreview()
         store.discardTransient([s.nodeId])
         this.host.commit({ type: 'create', nodes: [final] })
         this.host.onTransientCommitted([final.id])
         this.host.setTool({ kind: 'select' })
+        return
+      }
+      case 'connector': {
+        this.host.onPendingConnector(null)
+        if (cancelled) {
+          store.cancelPreview()
+          store.discardTransient([s.nodeId])
+          return
+        }
+        const node = store.get(s.nodeId)
+        if (!node || node.type !== 'connector') return
+        // A connector with neither end bound is a line to nowhere. Committing it would leave an
+        // invisible orphan in the document, every layer list and export, so drop it instead.
+        if (!node.fromId && !node.toId) {
+          store.cancelPreview()
+          store.discardTransient([s.nodeId])
+          return
+        }
+        store.endPreview()
+        store.discardTransient([s.nodeId])
+        const bound = node.type === 'connector' ? { ...node, toId: s.toId } : node
+        this.host.commit({ type: 'create', nodes: [bound] })
+        this.host.onTransientCommitted([node.id])
+        store.select([node.id])
+        this.host.setTool({ kind: 'select' })
+        return
+      }
+      case 'connectorEnd': {
+        // One update, on release — the endpoints were previewed, never written.
+        const patches = cancelled ? (store.cancelPreview(), []) : store.endPreview()
+        this.host.commit({ type: 'update', patches })
         return
       }
       default:
@@ -432,6 +675,9 @@ export class PointerInput {
 
   /** Supplied by the editor so the renderer overlay can show the live marquee. */
   onMarquee: ((r: Rect | null) => void) | null = null
+  /** Hover reporting, assigned by the editor. A callback rather than a host method because hover is
+   *  presentation-only: the pointer has no business knowing that a hover ring exists. */
+  onHover: (id: string | null) => void = () => {}
 
   // ------------------------------------------------------------ misc handlers
 

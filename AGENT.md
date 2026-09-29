@@ -22,9 +22,15 @@ npm run dev          # dev server
 npm run build        # production build
 npm run lint         # eslint (flat config)
 npx tsc --noEmit     # typecheck
-node --test          # unit tests (node:test, no canvas)
+npm test             # unit tests (node:test, no canvas)
+npm run test:smoke   # drives a real browser and reads canvas pixels back (needs dev server up)
 npx playwright test  # integration tests (dev-only dep)
 ```
+
+`test:smoke` is not optional garnish. It exists because 100 unit tests passed while undo silently
+did nothing and sticky text overflowed its note — neither bug is visible to a pure-logic test. Any
+change to the render loop, the pointer state machine, or undo ordering needs a smoke run on top of
+the unit suite, not instead of it.
 
 **All four of lint, typecheck, and tests must pass before claiming anything is done.** Run them,
 show the output. "Should work" means unfinished.

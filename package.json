@@ -9,6 +9,8 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "node --import ./test/hooks/register.mjs --test test/*.test.ts",
+    "test:smoke": "node test/smoke.mjs",
+    "test:smoke:connectors": "node test/smoke-connectors.mjs",
     "test:e2e": "playwright test",
     "party:dev": "partykit dev",
     "party:deploy": "partykit deploy"

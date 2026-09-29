@@ -11,9 +11,21 @@
 
 import type { Rect, Vec } from '../geometry'
 import type { SceneStore } from '../store'
-import type { BoardNode, DrawNode, FrameNode, GroupNode, ShapeNode, StickyNode, TextNode } from '../types'
+import type {
+  BoardNode,
+  ConnectorNode,
+  DrawNode,
+  FrameNode,
+  GroupNode,
+  ShapeNode,
+  StickyNode,
+  TextNode,
+} from '../types'
+import type { Guide } from '../snap'
 import { nodeBounds } from '../types'
 import { fitCanvas, toScreen, visibleWorldRect } from '../viewport'
+import { DEFAULT_STYLE } from '../types'
+import { drawConnector, drawPendingConnector } from './connectors'
 import { chaikinStroke, strokeOutline } from './draw'
 import { shapePath } from './shapes'
 import type { Ctx2D } from '../text'
@@ -37,6 +49,13 @@ export type OverlayState = {
   /** Node under the cursor, for the hover ring. */
   hoverId: string | null
   remote: RemoteCursor[]
+  /**
+   * Alignment guides for the gesture in flight, world space. Drawn unclipped like the marquee: a
+   * guide that stops at the dirty-rect edge while you drag looks like a rendering fault.
+   */
+  guides: Guide[]
+  /** Dashed route of a connector being dragged out, before either end is committed. */
+  pendingConnector: Vec[] | null
 }
 
 export class Renderer {
@@ -44,7 +63,13 @@ export class Renderer {
   private frame = 0
   private cssW = 0
   private cssH = 0
-  private overlay: OverlayState = { marquee: null, hoverId: null, remote: [] }
+  private overlay: OverlayState = {
+    marquee: null,
+    hoverId: null,
+    remote: [],
+    guides: [],
+    pendingConnector: null,
+  }
   /** Geometry cache for the node currently being dragged, so hit tests do not rebuild outlines. */
   private strokeCache = new Map<string, Vec[]>()
 
@@ -149,6 +174,14 @@ export class Renderer {
   // ------------------------------------------------------------ nodes
 
   private drawNode(ctx: Ctx2D, n: BoardNode, vp: { x: number; y: number; scale: number }): void {
+    // A connector's route is already in world coordinates, resolved from its two endpoints, so it
+    // must not go through the local-transform path below — that would offset it by the connector's
+    // own (meaningless) bounding box. Drawn here in world space instead.
+    if (n.type === 'connector') {
+      this.drawConnector(ctx, n, vp)
+      return
+    }
+
     const screen = toScreen({ x: n.x, y: n.y }, vp)
 
     ctx.save()
@@ -179,6 +212,25 @@ export class Renderer {
         break
     }
     ctx.restore()
+  }
+
+  private drawConnector(
+    ctx: Ctx2D,
+    n: ConnectorNode,
+    vp: { x: number; y: number; scale: number },
+  ): void {
+    const pts = this.store.connectorPath(n.id)
+    if (pts.length === 0) return
+    drawConnector(ctx, {
+      pts,
+      style: n.style,
+      startArrow: n.startArrow,
+      endArrow: n.endArrow,
+      label: n.label,
+      scale: vp.scale,
+      theme: theme(),
+      selected: this.store.selection.has(n.id),
+    })
   }
 
   private drawShape(ctx: Ctx2D, n: ShapeNode): void {
@@ -222,7 +274,10 @@ export class Renderer {
       ctx.lineWidth = 1
       ctx.stroke()
     }
-    this.paintText(ctx, n.text, { ...s, align: 'left', valign: 'top' }, n.w, n.h, true, true)
+    // `autoHeight: false` is load-bearing. A sticky is a fixed box the user sized by dragging, so its
+    // text must wrap to that width. Passing true made `layoutText` skip wrapping entirely and return
+    // the raw single line, which then overflowed the note and painted outside it.
+    this.paintText(ctx, n.text, { ...s, align: 'left', valign: 'top' }, n.w, n.h, false, true)
   }
 
   private drawFrame(ctx: Ctx2D, n: FrameNode): void {
@@ -324,14 +379,64 @@ export class Renderer {
 
   // ------------------------------------------------------------ overlays
 
+  /** True when the selection is one or more connectors and nothing resizable. */
+  private selectionIsOnlyConnectors(): boolean {
+    if (this.store.selection.size === 0) return false
+    for (const id of this.store.selection) {
+      if (this.store.get(id)?.type !== 'connector') return false
+    }
+    return true
+  }
+
+  /**
+   * Alignment guides.
+   *
+   * Screen-constant weight, in the theme's brass so they read as "the app is helping" rather than
+   * as content. Dashed, because a solid line at these positions reads as a node edge.
+   */
+  private drawGuides(ctx: Ctx2D, vp: { x: number; y: number; scale: number }): void {
+    if (this.overlay.guides.length === 0) return
+    ctx.save()
+    ctx.strokeStyle = theme().brass
+    ctx.lineWidth = 1
+    ctx.setLineDash([4, 3])
+    for (const g of this.overlay.guides) {
+      ctx.beginPath()
+      if (g.axis === 'x') {
+        const p = toScreen({ x: g.at, y: g.from }, vp)
+        ctx.moveTo(p.x, p.y)
+        ctx.lineTo(p.x, p.y + g.to * vp.scale - g.from * vp.scale)
+      } else {
+        const p = toScreen({ x: g.from, y: g.at }, vp)
+        ctx.moveTo(p.x, p.y)
+        ctx.lineTo(p.x + (g.to - g.from) * vp.scale, p.y)
+      }
+      ctx.stroke()
+    }
+    ctx.setLineDash([])
+    ctx.restore()
+  }
+
   private drawOverlays(ctx: Ctx2D, vp: { x: number; y: number; scale: number }): void {
     const t = theme()
     const sel = this.store.selection
     const selRect = this.store.selectionBounds()
 
+    this.drawGuides(ctx, vp)
+
+    if (this.overlay.pendingConnector && this.overlay.pendingConnector.length > 1) {
+      // Overlays are drawn in screen space, so world points are converted here rather than by
+      // setting a transform — a stray scale/translate would leak into the marquee drawn after it.
+      const screenPts = this.overlay.pendingConnector.map((p) => toScreen(p, vp))
+      drawPendingConnector(ctx, screenPts, DEFAULT_STYLE, t, vp.scale)
+    }
+
     if (this.overlay.hoverId && !sel.has(this.overlay.hoverId)) {
       const n = this.store.get(this.overlay.hoverId)
-      if (n) this.ring(ctx, nodeBounds(n), vp, alpha(t.brass, 0.45), 1.5 / vp.scale)
+      // Same reasoning as the selection ring: a rectangle around a line reads as a box.
+      if (n && n.type !== 'connector') {
+        this.ring(ctx, nodeBounds(n), vp, alpha(t.brass, 0.45), 1.5 / vp.scale)
+      }
     }
 
     if (sel.size > 0 && selRect) {
@@ -343,24 +448,34 @@ export class Renderer {
       const size = 8
       for (const id of sel) {
         const n = this.store.get(id)
-        if (n) this.ring(ctx, nodeBounds(n), vp, t.brass, 1.5 / vp.scale)
+        // No ring around a connector: it is already drawn in brass when selected, and a rectangle
+        // around a line implies an editable box that does not exist. The per-node `ring` call also
+        // happens for connectors in `drawOverlays`'s hover branch, and is skipped there for the
+        // same reason.
+        if (n && n.type !== 'connector') this.ring(ctx, nodeBounds(n), vp, t.brass, 1.5 / vp.scale)
       }
-      // One transform frame around the whole selection.
-      const a = toScreen({ x: selRect.x, y: selRect.y }, vp)
-      const b = toScreen({ x: selRect.x + selRect.w, y: selRect.y + selRect.h }, vp)
-      const corners: Vec[] = [
-        { x: a.x, y: a.y },
-        { x: b.x, y: a.y },
-        { x: b.x, y: b.y },
-        { x: a.x, y: b.y },
-      ]
-      for (const c of corners) {
-        ctx.fillStyle = t.sheet
-        ctx.strokeStyle = t.brass
-        ctx.beginPath()
-        ctx.rect(c.x - size / 2, c.y - size / 2, size, size)
-        ctx.fill()
-        ctx.stroke()
+      // One transform frame around the whole selection — but only when resizing it could mean
+      // something. A connector's box is *derived* from its route, so a resize handle on it is a lie:
+      // dragging it appears to work and is silently reverted on the next re-derivation. Endpoints
+      // are dragged on the canvas instead, which is the gesture that actually changes the line.
+      const resizable = !this.selectionIsOnlyConnectors()
+      if (resizable) {
+        const a = toScreen({ x: selRect.x, y: selRect.y }, vp)
+        const b = toScreen({ x: selRect.x + selRect.w, y: selRect.y + selRect.h }, vp)
+        const corners: Vec[] = [
+          { x: a.x, y: a.y },
+          { x: b.x, y: a.y },
+          { x: b.x, y: b.y },
+          { x: a.x, y: b.y },
+        ]
+        for (const c of corners) {
+          ctx.fillStyle = t.sheet
+          ctx.strokeStyle = t.brass
+          ctx.beginPath()
+          ctx.rect(c.x - size / 2, c.y - size / 2, size, size)
+          ctx.fill()
+          ctx.stroke()
+        }
       }
       ctx.restore()
     }

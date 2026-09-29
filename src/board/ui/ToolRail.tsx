@@ -26,6 +26,7 @@ import {
   IconEllipse,
   IconFit,
   IconFrame,
+  IconConnector,
   IconHand,
   IconHexagon,
   IconPill,
@@ -54,12 +55,24 @@ const ICONS: Record<string, ComponentType<{ className?: string }>> = {
   sticky: IconSticky,
   draw: IconDraw,
   frame: IconFrame,
+  connector: IconConnector,
 }
 
 const keyOf = (t: Tool): string => (t.kind === 'shape' ? t.shape : t.kind)
 
 /** Split so the two groups can each carry a label without a heading eating vertical space. */
-const PRIMARY = ['select', 'hand', 'rect', 'ellipse', 'diamond', 'sticky', 'text', 'draw', 'frame']
+const PRIMARY = [
+  'select',
+  'hand',
+  'rect',
+  'ellipse',
+  'diamond',
+  'connector',
+  'sticky',
+  'text',
+  'draw',
+  'frame',
+]
 const SECONDARY = ['triangle', 'hexagon', 'cylinder', 'cloud', 'document', 'pill']
 
 type Props = {

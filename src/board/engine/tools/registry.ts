@@ -17,6 +17,7 @@ export type Tool =
   | { kind: 'sticky' }
   | { kind: 'draw' }
   | { kind: 'frame' }
+  | { kind: 'connector' }
 
 export type ToolDef = {
   tool: Tool
@@ -83,6 +84,16 @@ export const TOOLS: ToolDef[] = [
     style: { fill: 'rgba(255,255,255,0.55)', stroke: '#a5a5c8' },
     size: { w: 640, h: 480 },
   },
+  {
+    tool: { kind: 'connector' },
+    label: 'Connector',
+    key: 'l',
+    cursor: 'crosshair',
+    // Unfilled and unstyled-by-default: a connector is a line first. `strokeWidth` 2 keeps it
+    // visible at the 5%–32% zoom range the viewport allows.
+    style: { fill: null, stroke: '#4f46e5', strokeWidth: 2, color: '#1e1b4b' },
+    size: { w: 0, h: 0 },
+  },
 ]
 
 export const toolByKey = (key: string): ToolDef | undefined =>
@@ -132,6 +143,11 @@ export function createNode(tool: Tool, rect: { x: number; y: number; w: number; 
       return makeNode({ type: 'sticky', text: '', author: null, x: rect.x, y: rect.y, w: rect.w, h: rect.h, z, style })
     case 'frame':
       return makeNode({ type: 'frame', title: 'Frame', x: rect.x, y: rect.y, w: rect.w, h: rect.h, z, style })
+    case 'connector':
+      // Not created by `createNode`. A connector is built by the pointer's connector gesture, which
+      // needs to know which node the drag started on — that is the entire content of the node, and
+      // the drag rect is irrelevant to it.
+      return null
     default:
       return null
   }

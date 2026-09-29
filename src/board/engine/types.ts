@@ -106,6 +106,33 @@ export type GroupNode = NodeBase & {
   childIds: string[]
 }
 
+/**
+ * An edge between two nodes.
+ *
+ * `fromId`/`toId` are node ids and `fromSide`/`toSide` are sides, never raw points. That is the whole
+ * design: because the endpoints are *references*, moving either node re-routes the line for everyone
+ * automatically, and two people moving the two ends never conflict — they are editing different
+ * fields. Storing coordinates instead would mean every drag of a node had to also rewrite every
+ * attached connector, which is both O(edges) and a merge conflict waiting to happen.
+ *
+ * The `*Side` fields are nullable on purpose. Null means "work it out from where the other end is",
+ * so a connector follows its nodes until someone deliberately pins an end.
+ */
+export type ConnectorNode = NodeBase & {
+  type: 'connector'
+  fromId: string | null
+  toId: string | null
+  fromSide: import('./connector').AnchorSide | null
+  toSide: import('./connector').AnchorSide | null
+  /** Arrowheads, independent of each other — a dependency line often has one, a sequence has two. */
+  startArrow: boolean
+  endArrow: boolean
+  route: 'orthogonal' | 'straight'
+  label: string
+  /** Semantic payload, so story relationships reuse this one edge system. */
+  edgeKind: string | null
+}
+
 export type BoardNode =
   | ShapeNode
   | TextNode
@@ -113,6 +140,10 @@ export type BoardNode =
   | DrawNode
   | FrameNode
   | GroupNode
+  | ConnectorNode
+
+/** Nodes that connectors may bind to. A connector cannot end on another connector. */
+export type ConnectableNode = Exclude<BoardNode, ConnectorNode>
 
 export type NodeType = BoardNode['type']
 

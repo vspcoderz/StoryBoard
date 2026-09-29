@@ -1,0 +1,6 @@
+{
+  "$schema": "https://www.partykit.io/schema.json",
+  "name": "storyboard",
+  "main": "party/server.ts",
+  "compatibilityDate": "2024-10-01"
+}

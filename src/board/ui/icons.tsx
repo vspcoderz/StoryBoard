@@ -130,3 +130,12 @@ export const IconFit = ({ className }: P) => (
     <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
   </svg>
 )
+
+/** A right-pointing arrow between two dots: the connector tool, distinct from the freehand squiggle. */
+export const IconConnector = ({ className }: P) => (
+  <svg {...base} className={className}>
+    <circle cx="5" cy="12" r="2" />
+    <path d="M8 12h7" />
+    <path d="M12.5 8.5L16 12l-3.5 3.5" />
+  </svg>
+)

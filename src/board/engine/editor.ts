@@ -52,7 +52,13 @@ export class Editor {
   private history: string[] = []
   private future: string[] = []
   private clipboard: BoardNode[] = []
-  private overlay: OverlayState = { marquee: null, hoverId: null, remote: [] }
+  private overlay: OverlayState = {
+    marquee: null,
+    hoverId: null,
+    remote: [],
+    guides: [],
+    pendingConnector: null,
+  }
   private listeners: { [K in keyof EditorEvents]: Set<EditorEvents[K]> } = {
     tool: new Set(),
     selection: new Set(),
@@ -84,13 +90,33 @@ export class Editor {
       requestRender: () => this.requestRender(),
       beginTextEdit: (id) => this.textEditor.open(id),
       isTextEditing: () => this.textEditor.isOpen,
-      commit: (m) => {
-        this.mutate(m)
-        this.afterCommit()
+      setGuides: (guides) => {
+        this.overlay.guides = guides
+        this.renderer.setOverlay({ guides })
+        if (guides.length > 0) this.requestRender()
       },
-      onTransientCommitted: () => this.afterCommit(),
+      onPendingConnector: (pts) => {
+        this.overlay.pendingConnector = pts
+        this.renderer.setOverlay({ pendingConnector: pts })
+      },
+      commit: (m) => {
+        // Undo point first, then mutate — see pushHistory. On the create path the node is still
+        // transient here, so it is correctly excluded from the captured snapshot.
+        this.pushHistory()
+        this.mutate(m)
+      },
+      // The node just landed via commit above, which already pushed the undo point. Pushing again
+      // would add a second, redundant entry and make one undo appear to do nothing.
+      onTransientCommitted: () => {},
       onTransientDiscarded: () => {},
     })
+    // The hover ring was computed by the pointer but never handed to the renderer, so the ring in
+    // `drawOverlays` was unreachable. One line, and it is the difference between a board that feels
+    // alive and one where you cannot tell what you are about to grab.
+    this.pointer.onHover = (id) => {
+      this.overlay.hoverId = id
+      this.renderer.setOverlay({ hoverId: id })
+    }
     this.pointer.onMarquee = (r) => {
       this.overlay.marquee = r
       this.renderer.setOverlay({ marquee: r })
@@ -346,23 +372,27 @@ export class Editor {
         this.requestRender()
         return
       }
+      this.pushHistory()
       this.mutate({ type: 'remove', ids: [id] })
-      this.afterCommit()
     }
   }
 
   // ------------------------------------------------------------ undo
 
+  /**
+   * Capture the current scene as an undo point.
+   *
+   * MUST be called *before* the mutation is applied. Undo restores a snapshot, so pushing
+   * afterwards stores the state you are already in and undo becomes a no-op. `snapshot` omits
+   * transient nodes, which is what makes this safe on the create path: the in-progress node is
+   * still transient at this point, so the captured state is genuinely "before this node existed".
+   */
   private pushHistory(): void {
     if (this.bridge) return // the CRDT's UndoManager keeps its own stack
     this.history.push(snapshot(this.store))
     if (this.history.length > HISTORY_LIMIT) this.history.shift()
+    // A fresh edit invalidates the redo stack, but only once the edit is real.
     this.future = []
-  }
-
-  /** Called after a local gesture commits. */
-  private afterCommit(): void {
-    this.pushHistory()
   }
 
   undo(): void {

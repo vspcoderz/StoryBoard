@@ -33,6 +33,7 @@ const TYPE_LABEL: Record<BoardNode['type'], string> = {
   draw: 'Drawing',
   frame: 'Frame',
   group: 'Group',
+  connector: 'Connector',
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
@@ -119,7 +120,9 @@ export function Inspector({ editor, selection }: { editor: Editor | null; select
         </p>
       </div>
 
-      {node.type !== 'draw' && node.type !== 'frame' && (
+      {/* A connector has a `label`, not `text`, and its w/h are the route's bounding box — both are
+          meaningless to edit by hand, so those controls are hidden for it rather than shown broken. */}
+      {node.type !== 'draw' && node.type !== 'frame' && node.type !== 'connector' && (
         <Field label="Text">
           <textarea
             className={`${inputClass} min-h-16 resize-y`}
@@ -146,43 +149,99 @@ export function Inspector({ editor, selection }: { editor: Editor | null; select
         </Field>
       )}
 
-      <div className="grid grid-cols-2 gap-2">
-        <Field label="Width">
-          <input
-            type="number"
-            className={inputClass}
-            value={Math.round(node.w)}
-            onChange={(e) => patch({ w: Math.max(1, Number(e.target.value) || 1) })}
-          />
-        </Field>
-        <Field label="Height">
-          <input
-            type="number"
-            className={inputClass}
-            value={Math.round(node.h)}
-            onChange={(e) => patch({ h: Math.max(1, Number(e.target.value) || 1) })}
-          />
-        </Field>
-      </div>
+      {node.type === 'connector' && (
+        <>
+          <Field label="Label">
+            <input
+              className={inputClass}
+              value={node.label}
+              placeholder="e.g. motivates"
+              onChange={(e) => patch({ label: e.target.value })}
+            />
+          </Field>
 
-      <Field label="Fill">
-        <div className="flex items-center gap-2">
-          <input
-            type="color"
-            aria-label="Fill colour"
-            className="h-8 w-9 cursor-pointer rounded border border-line bg-sheet"
-            value={s.fill ?? '#ffffff'}
-            onChange={(e) => patchStyle({ fill: e.target.value })}
-          />
-          <button
-            type="button"
-            className="rounded-md border border-line bg-surface px-2 py-1.5 text-[12px] text-graphite hover:text-ink"
-            onClick={() => patchStyle({ fill: null })}
-          >
-            None
-          </button>
+          <Field label="Route">
+            <select
+              className={inputClass}
+              value={node.route}
+              onChange={(e) => patch({ route: e.target.value as 'orthogonal' | 'straight' })}
+            >
+              <option value="orthogonal">Elbow</option>
+              <option value="straight">Straight</option>
+            </select>
+          </Field>
+
+          <fieldset className="flex flex-col gap-1.5">
+            <legend className="text-[11px] font-medium text-graphite">Arrows</legend>
+            <label className="flex items-center gap-2 text-[13px] text-ink">
+              <input
+                type="checkbox"
+                checked={node.startArrow}
+                onChange={(e) => patch({ startArrow: e.target.checked })}
+              />
+              Start
+            </label>
+            <label className="flex items-center gap-2 text-[13px] text-ink">
+              <input
+                type="checkbox"
+                checked={node.endArrow}
+                onChange={(e) => patch({ endArrow: e.target.checked })}
+              />
+              End
+            </label>
+          </fieldset>
+
+          <p className="text-[11px] text-quiet">
+            Drag an endpoint on the canvas to re-bind it to another node.
+          </p>
+        </>
+      )}
+
+      {/* A connector's w/h are the bounding box of its route, re-derived on every change. Editing
+          them would type a number that the next render overwrites, so they are not offered. */}
+      {node.type !== 'connector' && (
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="Width">
+            <input
+              type="number"
+              className={inputClass}
+              value={Math.round(node.w)}
+              onChange={(e) => patch({ w: Math.max(1, Number(e.target.value) || 1) })}
+            />
+          </Field>
+          <Field label="Height">
+            <input
+              type="number"
+              className={inputClass}
+              value={Math.round(node.h)}
+              onChange={(e) => patch({ h: Math.max(1, Number(e.target.value) || 1) })}
+            />
+          </Field>
         </div>
-      </Field>
+      )}
+
+      {/* A line has no interior. Offering a fill control that silently does nothing is worse than
+          not offering it. */}
+      {node.type !== 'connector' && (
+        <Field label="Fill">
+          <div className="flex items-center gap-2">
+            <input
+              type="color"
+              aria-label="Fill colour"
+              className="h-8 w-9 cursor-pointer rounded border border-line bg-sheet"
+              value={s.fill ?? '#ffffff'}
+              onChange={(e) => patchStyle({ fill: e.target.value })}
+            />
+            <button
+              type="button"
+              className="rounded-md border border-line bg-surface px-2 py-1.5 text-[12px] text-graphite hover:text-ink"
+              onClick={() => patchStyle({ fill: null })}
+            >
+              None
+            </button>
+          </div>
+        </Field>
+      )}
 
       <Field label="Outline">
         <div className="flex items-center gap-2">

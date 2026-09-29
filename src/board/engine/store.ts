@@ -12,8 +12,10 @@
  */
 
 import type { Rect, Vec } from './geometry'
-import { clamp, rectUnion, rectUnionAll } from './geometry'
+import { clamp, rectCenter, rectFromPoints, rectUnion, rectUnionAll } from './geometry'
+import { anchorPoint, bestSide, hitPath, routeConnector } from './connector'
 import { hitNode } from './hit'
+import { snapNeighbours, snapRect, type Guide } from './snap'
 import { SpatialIndex } from './spatial'
 import type { BoardNode, NodeBase } from './types'
 import { nodeBounds } from './types'
@@ -23,8 +25,17 @@ export type StoreEvent = 'change' | 'selection' | 'viewport'
 
 type Listener = (ev: StoreEvent) => void
 
-/** Fields that may be shadowed by the uncommitted preview during a drag. */
-export type NodePatch = Partial<Omit<BoardNode, 'id' | 'type'>>
+/**
+ * Fields that may be shadowed by the uncommitted preview during a drag.
+ *
+ * `Omit` over a union collapses it — `Omit<A | B, 'x'>` keeps only the keys common to both, so
+ * adding a node type with a new field silently makes that field unpatchable. Distributing the omit
+ * over the union first is what keeps per-type fields (a connector's `fromId`, a sticky's `author`)
+ * individually patchable, which is the whole point of the one-Y.Map-per-node model.
+ */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
+
+export type NodePatch = Partial<DistributiveOmit<BoardNode, 'id' | 'type'>>
 
 export class SceneStore {
   private nodes = new Map<string, BoardNode>()
@@ -60,6 +71,21 @@ export class SceneStore {
 
   private emit(ev: StoreEvent): void {
     for (const fn of this.listeners) fn(ev)
+  }
+
+  /**
+   * The single post-mutation hook.
+   *
+   * Every mutating method ends here. This exists because connector bounds are *derived*, and a
+   * derived value that has to be refreshed by each caller is a derived value that will be forgotten:
+   * it was wired into `add` but not `addMany`, so a connector created through a mutation kept its
+   * seeded 200×120 box, was culled by the wrong rectangle, and reported nonsense dimensions in the
+   * inspector. Funnelling every mutation through one hook makes the omission impossible rather than
+   * merely unlikely.
+   */
+  private afterChange(): void {
+    this.syncConnectorBounds()
+    this.emit('change')
   }
 
   // ------------------------------------------------------------ dirty tracking
@@ -103,6 +129,22 @@ export class SceneStore {
 
   get size(): number {
     return this.nodes.size
+  }
+
+  /**
+   * Delete nodes and every connector bound to them.
+   *
+   * A connector whose endpoint is gone would otherwise linger as an invisible orphan: it still
+   * occupies z, still shows in the layer list, and still round-trips through the CRDT forever. Since
+   * connectors are defined by their references, cascading here is the only place it can be correct.
+   */
+  private removeOrphanedConnectors(removed: Set<string>): void {
+    const orphans: string[] = []
+    for (const n of this.nodes.values()) {
+      if (n.type !== 'connector') continue
+      if ((n.fromId && removed.has(n.fromId)) || (n.toId && removed.has(n.toId))) orphans.push(n.id)
+    }
+    if (orphans.length > 0) this.remove(orphans)
   }
 
   has(id: string): boolean {
@@ -170,7 +212,7 @@ export class SceneStore {
     this.index.insert(node.id, nodeBounds(node))
     this.sortedCache = null
     this.markDirty(nodeBounds(node))
-    this.emit('change')
+    this.afterChange()
   }
 
   /** Add many in one pass. Used for paste, templates and undo, where per-node events would thrash. */
@@ -184,7 +226,7 @@ export class SceneStore {
     }
     this.sortedCache = null
     this.markDirty(dirty)
-    this.emit('change')
+    this.afterChange()
   }
 
   update(id: string, patch: NodePatch): void {
@@ -196,7 +238,7 @@ export class SceneStore {
     const after = nodeBounds(next)
     this.index.insert(id, after)
     this.markDirty(rectUnion(before, after))
-    this.emit('change')
+    this.afterChange()
   }
 
   updateMany(patches: Iterable<[string, NodePatch]>): void {
@@ -213,11 +255,13 @@ export class SceneStore {
     }
     this.sortedCache = null
     this.markDirty(dirty)
-    this.emit('change')
+    // A moved node re-routes every connector bound to it, so their culling boxes are now wrong.
+    this.afterChange()
   }
 
   remove(ids: Iterable<string>): void {
     let dirty: Rect | null = null
+    const removed = new Set<string>()
     for (const id of ids) {
       const n = this.nodes.get(id)
       if (!n) continue
@@ -225,10 +269,14 @@ export class SceneStore {
       this.nodes.delete(id)
       this.index.remove(id)
       this.sel.delete(id)
+      removed.add(id)
     }
     this.sortedCache = null
     this.markDirty(dirty)
-    this.emit('change')
+    // Orphaned connectors go first: `afterChange` re-derives bounds, and a connector whose endpoint
+    // no longer exists must be gone before anything tries to route it.
+    this.removeOrphanedConnectors(removed)
+    this.afterChange()
     this.emit('selection')
   }
 
@@ -248,6 +296,45 @@ export class SceneStore {
       if (b) rects.push(b)
     }
     return rectUnionAll(rects)
+  }
+
+  /** Ids of every connector, for the pointer's endpoint-grab pass. */
+  connectorIds(): string[] {
+    const out: string[] = []
+    for (const n of this.nodes.values()) if (n.type === 'connector') out.push(n.id)
+    return out
+  }
+
+  /**
+   * Re-derive every connector's bounding box from its current route.
+   *
+   * A connector's `x`/`y`/`w`/`h` are not authored — they are the bounding box of the line the
+   * routing produces, and they exist purely so the spatial index can cull and query it. Which means
+   * they go stale the moment either endpoint moves, and a stale box makes the connector either
+   * vanish when it should be visible or get picked when it is nowhere near the cursor.
+   *
+   * Run after any change to node geometry. It is O(connectors) and touches no CRDT state, so it is
+   * cheap enough to do eagerly rather than lazily and risk a stale frame.
+   */
+  syncConnectorBounds(): void {
+    for (const id of this.connectorIds()) {
+      const n = this.nodes.get(id)
+      if (!n || n.type !== 'connector') continue
+      const pts = this.connectorPath(id)
+      if (pts.length === 0) {
+        // Unbound: park it on the origin with no size so it is culled away rather than drawn.
+        if (n.w !== 0 || n.h !== 0) {
+          this.nodes.set(id, { ...n, x: 0, y: 0, w: 0, h: 0 })
+          this.index.insert(id, { x: 0, y: 0, w: 0, h: 0 })
+        }
+        continue
+      }
+      const b = rectFromPoints(pts)
+      if (b.x === n.x && b.y === n.y && b.w === n.w && b.h === n.h) continue
+      this.nodes.set(id, { ...n, ...b })
+      this.index.insert(id, b)
+    }
+    this.sortedCache = null
   }
 
   /** All nodes, back to front. Cached until the next structural change. */
@@ -383,6 +470,73 @@ export class SceneStore {
   }
 
   /**
+   * The routed path of a connector, resolved against live node geometry.
+   *
+   * Connectors store node references, not points, so the path only exists at render and pick time.
+   * A connector whose ends are missing (deleted node, or a half-finished drag) resolves to an empty
+   * path rather than throwing — a dangling connector is a normal transient state, not an error.
+   */
+  connectorPath(id: string): Vec[] {
+    const c = this.get(id)
+    if (!c || c.type !== 'connector') return []
+    const from = this.boundsOf(c.fromId ?? '')
+    const to = this.boundsOf(c.toId ?? '')
+    if (!from || !to) return []
+    // Each end aims at the other end's anchor, so the choice is mutual and stable.
+    const toAim = anchorPoint(to, c.toSide ?? bestSide(to, rectCenter(from)))
+    const fromAim = anchorPoint(from, c.fromSide ?? bestSide(from, rectCenter(to)))
+    return routeConnector(
+      { bounds: from, side: c.fromSide, toward: toAim },
+      { bounds: to, side: c.toSide, toward: fromAim },
+      c.route,
+    )
+  }
+
+  /**
+   * Alignment candidates for a drag, and the snapped result.
+   *
+   * On the store rather than in the pointer because it needs both the index and live bounds. The
+   * pointer calls this per frame during a move; the result goes into the preview overlay, so a snap
+   * costs zero CRDT writes exactly like any other drag position.
+   */
+  snap(
+    moving: Rect,
+    movingIds: Iterable<string>,
+    scale: number,
+  ): { rect: Rect; guides: Guide[]; aligned: boolean } {
+    const ids = new Set(movingIds)
+    const others = snapNeighbours(this.index, moving, ids, scale, (id) => this.boundsOf(id))
+    return snapRect(moving, others, { scale })
+  }
+
+  /**
+   * Topmost connector whose line passes within `tolerance` of `p`.
+   *
+   * Separate from `pickExact` because a connector's clickable area is a thin path, not a box: a
+   * node whose bounding box contains the point can be nowhere near its drawn line. Testing
+   * connectors through the normal index path would mean clicking a line and grabbing whatever
+   * happened to overlap its bounding box.
+   */
+  pickConnector(p: Vec, tolerance: number): string | null {
+    // Widened because a connector's index box covers the whole span including empty space; we
+    // already know the exact test, so this is only a cheap prefilter.
+    const area = { x: p.x - tolerance, y: p.y - tolerance, w: tolerance * 2, h: tolerance * 2 }
+    const candidates = this.index.query(area)
+    let best: string | null = null
+    let bestZ = -Infinity
+    for (const id of candidates) {
+      const n = this.get(id)
+      if (!n || n.type !== 'connector' || !n.visible || n.locked) continue
+      if (n.z <= bestZ) continue
+      if (hitPath(this.connectorPath(id), p, tolerance)) {
+        best = id
+        bestZ = n.z
+      }
+    }
+    return best
+  }
+
+  /**
    * Topmost node at a world point, confirmed against its real outline.
    *
    * `pick` is AABB-only and fast but wrong for pointed shapes; this is the accurate one used for
@@ -403,7 +557,14 @@ export class SceneStore {
     })
     for (const id of candidates) {
       const n = this.get(id)
-      if (n && !n.locked && hitNode(n, p, tolerance)) return id
+      if (!n || n.locked) continue
+      if (n.type === 'connector') {
+        // Connectors route against other nodes, so their real hit test needs the store. Doing it
+        // here rather than in `hitNode` keeps that function pure and canvas-free.
+        if (hitPath(this.connectorPath(id), p, tolerance)) return id
+        continue
+      }
+      if (hitNode(n, p, tolerance)) return id
     }
     return null
   }

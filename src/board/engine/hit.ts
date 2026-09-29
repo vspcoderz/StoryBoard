@@ -40,6 +40,12 @@ export function hitNode(node: BoardNode, p: Vec, tolerance: number): boolean {
       const half = (node.baseWidth * (node.style.strokeWidth || 1)) / 2
       return distToStroke(pts, local) <= half + tolerance
     }
+    case 'connector':
+      // A connector is a line with no interior, and its route depends on other nodes' live geometry,
+      // which `hitNode` cannot see. The store resolves the route and tests proximity — see
+      // `SceneStore.pickConnector`. Returning false here is correct, not a stub: there is nothing
+      // meaningful to test without the neighbours.
+      return false
     case 'frame':
     case 'group':
       // Frames and groups are containers: you select them by their border or their contents, so a

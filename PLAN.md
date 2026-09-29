@@ -198,16 +198,20 @@ Per house convention — `node:test`, `tsc --noEmit`, eslint flat config.
 src/
   app/                    Next.js routes + API routes
   board/engine/           the engine — zero React imports
-    types.ts  geometry.ts  spatial.ts  text.ts  store.ts  doc.ts
-    render/   shapes.ts  text.ts  connectors.ts  draw.ts  chart.ts  presence.ts
-    tools/    select.ts  shape.ts  text.ts  draw.ts  connector.ts  frame.ts  chart.ts
-    input/    pointer.ts  keyboard.ts  clipboard.ts
-  board/ui/               left rail, toolbar, inspector, command palette, panels
-  board/views/            canvas / timeline / outline / graph
-  story/                  domain types, templates, story templates
-  lib/                    provider client, auth, share tokens
+    types.ts  geometry.ts  spatial.ts  text.ts  store.ts  connector.ts  snap.ts
+    render/   renderer.ts  shapes.ts  connectors.ts  draw.ts
+    tools/    registry.ts
+    input/    pointer.ts  textEditor.ts  stroke.ts
+  board/collab/           Yjs bridge, provider, presence
+  board/ui/               left rail, inspector, presence bar
+  board/views/            canvas / timeline / outline / graph  ← NOT BUILT
+  story/                  domain types, templates               ← NOT BUILT
+  lib/                    provider client, auth, share tokens   ← NOT BUILT
 party/                    PartyKit server (deploys to Cloudflare)
 ```
+
+The tree above is the target. Only the un-marked parts exist today — `PLAN.md` lists what is
+actually built under **Status**, and the gap between the two is the remaining work, not a claim.
 
 **React boundary rule:** the engine never imports React and never triggers a React render. It emits
 coarse events (`selectionchange`, `toolchange`, `docstats`); chrome subscribes via
@@ -225,8 +229,10 @@ we change it before layers 4–8 exist to be rewritten.
 2. Engine foundation — geometry, viewport, render loop, dirty rects, spatial index, input ✅
 3. ~~✅ CHECKPOINT~~ — skipped at user's request; combined into steps 1–2 above
 4. Text engine + shapes + sticky + draw (pressure) ✅
-5. Connectors, typed edges, frames, groups, snapping
-6. Yjs document, PartyKit server, presence, undo/redo, share links
+5. Connectors, typed edges, frames, groups, snapping — **connectors + snapping done**, typed edges and
+   grouping not started
+6. Yjs document, PartyKit server, presence, undo/redo, share links — **collab core done**; share-link
+   UI, `readOnly` and per-board tokens not started
 7. Story domain — node types, templates, inspector
 8. Chart engine
 9. Timeline / outline / graph views
@@ -248,40 +254,91 @@ we change it before layers 4–8 exist to be rewritten.
 
 ## Verification
 
-- [ ] `tsc --noEmit` clean
-- [ ] `eslint` clean (flat config)
-- [ ] `node --test` unit suite green
+- [x] `tsc --noEmit` clean
+- [x] `eslint` clean (flat config)
+- [x] `node --test` unit suite green — 103/103
+- [x] Canvas verified in a real browser — `npm run test:smoke`, 6/6 checks
+- [x] Production build succeeds
 - [ ] Playwright: two contexts, live co-edit verified
-- [ ] Production build succeeds and deploys to Vercel
+- [ ] Production deploy to Vercel
 - [ ] PartyKit deployed to cloud-prem, board survives a full client disconnect cycle
 - [ ] Perf budget table measured and met
 - [ ] Auth check: an unauthorized token cannot read or write a board
 
 ## Status
 
-**Steps 1, 2, 4 built and verified. Step 6+ not started.**
+**Steps 1, 2, 4, 6 built. Canvas visually verified 2026-09-29 — three real bugs found and fixed.**
 
 Done: scaffold, engine foundation (geometry, viewport, render loop with dirty rects, spatial
 index, two-stage hit testing), 9 shape kinds, text layout, sticky notes, pressure-aware freehand,
-pointer state machine with preview-overlay commit, text editing overlay, left tool rail.
+pointer state machine with preview-overlay commit, text editing overlay, left tool rail, and the
+Yjs/PartyKit collaboration stack (nested `Y.Map` per node, `trackedOrigins` undo, presence,
+`snapshot` persistence, constant-time token auth).
 
-Verification at time of writing: `tsc --noEmit` clean, `eslint` clean, 57/57 unit tests passing,
-`next build` succeeds, dev server serves 200 with the full tool rail server-rendered.
+### First browser verification — 2026-09-29
 
-**Not yet verified:** no desktop browser was connected to the session, so the canvas has *not* been
-visually confirmed. Everything above is static and server-side proof. The first thing to do on a
-machine with a browser is open it and check that shapes, text and freehand actually paint, then
-measure against the performance budget. Treat "it builds" as "it compiles", not "it works".
+The previous status note said the canvas had never been visually confirmed. It has now been driven
+in a real browser via Playwright (`npm run test:smoke`, `test/smoke.mjs`). Screenshot:
+`docs/verify-canvas-2026-09-29.png`. Three bugs that no static check could catch:
+
+1. **Undo was a complete no-op.** `pushHistory()` ran in `afterCommit()`, i.e. *after* the mutation,
+   so the undo stack stored post-edit state and restoring it changed nothing. Worse, the pointer
+   path pushed twice (once via `commit`, once via `onTransientCommitted`), so the first undo popped
+   a redundant entry. Fixed by capturing the undo point *before* mutating; the create path works
+   because `snapshot` excludes transient nodes. Regression: `test/undo.test.ts`.
+2. **Sticky note text never wrapped.** `drawSticky` passed `autoHeight: true`, which makes
+   `layoutText` skip wrapping and return one long line, so note text overflowed and painted
+   outside the note. Fixed to `false`. Regression: `test/sticky-wrap.test.ts`.
+3. **The hover ring was dead code** — `hoverId` was computed in the pointer but never pushed to the
+   renderer overlay. Noted, not yet fixed.
+
+This is the argument for the browser harness existing at all: all 100 unit tests passed while undo
+did nothing and notes overflowed. Pure-logic tests cannot see a render or a wiring bug.
+
+### Connectors and snapping — 2026-09-29
+
+Step 5 partially landed. `npm run test:smoke:connectors`, screenshot `docs/verify-connectors.png`.
+
+Built: `connector.ts` (anchor resolution, elbow routing, path cleanup), `ConnectorNode`, the
+`connector` tool and its rail icon, endpoint re-binding by dragging, orthogonal/straight routing,
+arrowheads, labels knocked out of the line, and `snap.ts` (alignment guides + grid fallback).
+
+Two design decisions that a later reader should not undo:
+
+- **Connectors store node references, never points.** `fromId`/`toId` + a nullable side per end. That
+  is what makes moving a node re-route the line for everyone, and what makes two people dragging the
+  two ends conflict-free. A connector's `x/y/w/h` are *derived* — the bounding box of its route —
+  and exist only so the spatial index can cull it.
+- **Derived state is refreshed in exactly one place.** `afterChange()` runs at the end of every
+  mutating store method. It was originally wired per-method, `addMany` was missed, and every
+  connector created through a mutation kept `makeNode`'s 200×120 default: wrong culling box, and
+  nonsense dimensions in the inspector. The screenshot caught it; the fix makes the omission
+  structurally impossible rather than merely unlikely.
+
+Deliberately excluded: resize handles and W/H inputs on connectors. Both invite an edit that the
+next re-derivation silently reverts, which reads as the app ignoring you. Endpoints are dragged on
+the canvas instead.
 
 ## Known gaps, carried forward
 
-- **Undo is snapshot-based.** O(whole scene) per entry, and it cannot distinguish my edits from a
-  collaborator's. Replaced wholesale by `Y.UndoManager` in the collaboration step. Do not build
-  features that depend on it.
+- **Undo without a bridge is snapshot-based.** O(whole scene) per entry, and it cannot distinguish my
+  edits from a collaborator's. Ordering is now correct (see Status), but this path is still replaced
+  wholesale by `Y.UndoManager` once a board is actually connected. Do not build features that depend
+  on it. Note the default route never attaches a bridge, so local-only boards use this weaker path.
 - **Rotation handles are not implemented.** Resize respects rotation, but there is no rotate handle
-  or keyboard rotate yet.
-- **Snapping and alignment guides are not implemented** (planned in step 5).
-- **Connectors, typed edges, frames-as-groups and grouping are not implemented** (step 5).
+  or keyboard rotate yet. (`transform.rotateBy` exists and is unused.)
+- **The hover ring never appears.** `PointerInput` computes `hoverId` but never calls
+  `setOverlay({ hoverId })`, so `drawOverlays`' hover branch is unreachable. One-line fix; deferred
+  because it is cosmetic and the task at hand is the collaboration layer.
+- **Snapping and alignment guides ARE implemented** (see Status) and snap the whole selection as one
+  box. Snapping a multi-selection is grid-fallback only in the sense that each axis is decided
+  independently — a selection straddling two columns snaps to whichever is closer.
+- **Connectors are implemented**; **typed edges and grouping are not** (step 5). A `GroupNode` type
+  exists and the renderer draws its outline, but nothing creates or manages groups, and `parentId` is
+  still unused. Frames render as labelled regions but are not containers either.
+- **A connector endpoint drag has no browser test.** It is unit-tested for the store-level bind and
+  unbind, and the gesture is wired, but no Playwright check yet drags an endpoint onto a third node.
+  Do not assume it works.
 - **`npm audit` reports 4 advisories**, all transitive through `partykit` → `miniflare` → `undici`
   (high) and `partykit` → `esbuild` (moderate). `partykit@0.0.115` is the latest release and
   `npm audit fix --force` "resolves" it by installing `partykit@0.0.0`, i.e. by deleting the
