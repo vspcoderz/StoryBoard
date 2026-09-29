@@ -14,13 +14,17 @@
 
 'use client'
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { Editor, type RemoteUser } from './engine/editor'
 import type { Tool } from './engine/tools/registry'
 import type { BridgeStatus } from './collab/ydoc'
 import { ToolRail } from './ui/ToolRail'
 import { Inspector } from './ui/Inspector'
 import { PresenceBar } from './ui/PresenceBar'
+import { ChatPanel, type ChatDocLike } from '../chat/ChatPanel'
+import { connectChat, setChatPresence, watchChatPresence } from '../chat/transport'
+import { randomUser, type ChatUser } from '../chat/model'
+import { watchStatus as watchProviderStatus } from './collab/provider'
 
 /** Stable identities so `getSnapshot` can never hand React a fresh object and loop forever. */
 const DEFAULT_TOOL: Tool = { kind: 'select' }
@@ -29,6 +33,36 @@ const ZERO_STATS = { nodes: 0, zoom: 1 }
 const NO_USERS: RemoteUser[] = []
 
 const BOARD_NAME = 'Untitled story'
+
+/** Where the local identity is kept between visits. */
+const IDENTITY_KEY = 'storyboard.identity'
+
+/**
+ * A stable local identity.
+ *
+ * Persisted so you keep your name and colour across reloads — a chat where you are a different
+ * person every time you open the tab is unusable. It is deliberately *local* and self-declared: this
+ * is the pre-auth behaviour, and `PLAN.md` lists real accounts as unbuilt. Swapping this for a
+ * server-issued user id is the intended upgrade path and touches only this function.
+ */
+function localIdentity(): ChatUser {
+  if (typeof localStorage === 'undefined') return randomUser()
+  try {
+    const raw = localStorage.getItem(IDENTITY_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw) as ChatUser
+      if (parsed && typeof parsed.id === 'string' && typeof parsed.name === 'string') {
+        return parsed
+      }
+    }
+    const fresh = randomUser()
+    localStorage.setItem(IDENTITY_KEY, JSON.stringify(fresh))
+    return fresh
+  } catch {
+    // Private mode, quota, corrupt JSON — a random identity is a fine degradation.
+    return randomUser()
+  }
+}
 
 export function BoardView({ boardId, token }: { boardId?: string; token?: string }) {
   const wrapRef = useRef<HTMLDivElement>(null)
@@ -90,6 +124,61 @@ export function BoardView({ boardId, token }: { boardId?: string; token?: string
     () => 'disconnected' as BridgeStatus,
   )
 
+  // ---------------------------------------------------------------- chat
+
+  const [me] = useState<ChatUser>(localIdentity)
+  const [chat, setChat] = useState<ChatDocLike | null>(null)
+  const [chatStatus, setChatStatus] = useState<BridgeStatus>('connecting')
+  const [peers, setPeers] = useState<ChatUser[]>([])
+
+  useEffect(() => {
+    if (!boardId) return
+    const conn = connectChat(boardId, token ?? null)
+    setChat(conn.chat)
+    setChatPresence(conn.provider, me)
+    const offPresence = watchChatPresence(conn.provider, (states) => {
+      setPeers(
+        states
+          .map((s) => s.user)
+          .filter((u): u is ChatUser => !!u && typeof (u as ChatUser).id === 'string'),
+      )
+    })
+    const offStatus = watchProviderStatus(conn.provider, setChatStatus)
+    return () => {
+      offPresence()
+      offStatus()
+      conn.destroy()
+      setChat(null)
+    }
+  }, [boardId, token, me])
+
+  // The roster is us plus everyone in the room. Mentions resolve against it, and a name that is not
+  // in the room deliberately does not resolve — see `parseMentions`.
+  const roster = useMemo(() => [me, ...peers], [me, peers])
+
+  /** Jump to a node a message or task refers to, and bring it into view. */
+  const revealNode = useCallback(
+    (nodeId: string) => {
+      if (!editor) return
+      editor.store.select([nodeId])
+      editor.revealNode(nodeId)
+    },
+    [editor],
+  )
+
+  /** A human name for the single selected node, so a chat pill can say what it points at. */
+  const selectedLabel = useMemo(() => {
+    if (!editor || selection.length !== 1) return null
+    const n = editor.store.get(selection[0])
+    if (!n) return null
+    if ('text' in n && typeof n.text === 'string' && n.text.trim()) {
+      return n.text.trim().slice(0, 32)
+    }
+    if (n.type === 'frame') return n.title
+    if (n.type === 'connector') return n.label || 'a connector'
+    return n.type
+  }, [editor, selection])
+
   return (
     <div className="flex h-dvh w-full overflow-hidden bg-desk text-ink">
       <ToolRail
@@ -140,6 +229,41 @@ export function BoardView({ boardId, token }: { boardId?: string; token?: string
       </div>
 
       <Inspector editor={editor} selection={selection} />
+
+      {boardId ? (
+        <ChatPanel
+          chat={chat}
+          me={me}
+          roster={roster}
+          status={chatStatus}
+          onRevealNode={revealNode}
+          selectedNodeId={selection.length === 1 ? selection[0] : null}
+          selectedNodeLabel={selectedLabel}
+        />
+      ) : (
+        <LocalChatHint />
+      )}
     </div>
+  )
+}
+
+/**
+ * Why chat is absent on the default route.
+ *
+ * Shown instead of an empty panel because a chat box that silently refuses to send is worse than one
+ * that explains itself. The default route has no board id, so there is no room to talk in.
+ */
+function LocalChatHint() {
+  return (
+    <aside
+      aria-label="Conversation"
+      className="flex w-80 shrink-0 flex-col items-center justify-center gap-2 border-l border-line bg-desk px-6 text-center"
+    >
+      <h2 className="text-[11px] font-semibold text-graphite">Conversation</h2>
+      <p className="text-[12px] leading-relaxed text-quiet">
+        Chat is per board. Open a shared board and the conversation for it appears here, alongside the
+        diagram and the tasks.
+      </p>
+    </aside>
   )
 }

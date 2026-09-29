@@ -24,7 +24,7 @@ import { snapshot, restore } from './serialize'
 import { SceneStore } from './store'
 import { toolByKey, type Tool } from './tools/registry'
 import { makeNode, DEFAULT_STYLE, newId, type BoardNode, type Style } from './types'
-import { rectUnionAll } from './geometry'
+import { rectCenter, rectUnionAll } from './geometry'
 import { zoomAt, toWorld, type Viewport } from './viewport'
 import { initTheme } from './theme'
 import { YDocBridge, type BridgeStatus } from '../collab/ydoc'
@@ -519,6 +519,36 @@ export class Editor {
       scale: s,
       x: union.x - (r.width / s - union.w) / 2,
       y: union.y - (r.height / s - union.h) / 2,
+    })
+  }
+
+  /**
+   * Centre the viewport on one node, keeping the current zoom.
+   *
+   * This is what a chat message's node link does. Keeping the zoom is deliberate: `zoomToFit` would
+   * jump the whole board scale, so clicking a link while reading a conversation would throw away
+   * wherever the reader was looking. If the node is already comfortably in view, do nothing at all —
+   * an animation that moves a board you were reading is worse than no animation.
+   */
+  revealNode(id: string): void {
+    const b = this.store.getBounds(id)
+    if (!b) return
+    const vp = this.store.viewport
+    const r = this.container.getBoundingClientRect()
+    if (r.width === 0 || r.height === 0) return
+
+    const c = rectCenter(b)
+    const left = c.x * vp.scale + vp.x
+    const top = c.y * vp.scale + vp.y
+    const margin = 80
+    const visible =
+      left > margin && top > margin && left < r.width - margin && top < r.height - margin
+    if (visible) return
+
+    this.store.setViewport({
+      scale: vp.scale,
+      x: r.width / 2 - c.x * vp.scale,
+      y: r.height / 2 - c.y * vp.scale,
     })
   }
 

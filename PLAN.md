@@ -234,7 +234,7 @@ we change it before layers 4–8 exist to be rewritten.
 6. Yjs document, PartyKit server, presence, undo/redo, share links — **collab core done**; share-link
    UI, `readOnly` and per-board tokens not started
 7. Story domain — node types, templates, inspector
-8. Chart engine
+8. Chart engine — **NOT STARTED. `d3-scale` and `d3-shape` are dependencies that nothing imports.**
 9. Timeline / outline / graph views
 10. Chrome — rail, palette, command palette, inspector, panels
 11. Export (PNG / SVG / JSON / Markdown), perf pass, hardening
@@ -318,6 +318,44 @@ Two design decisions that a later reader should not undo:
 Deliberately excluded: resize handles and W/H inputs on connectors. Both invite an edit that the
 next re-derivation silently reverts, which reads as the app ignoring you. Endpoints are dragged on
 the canvas instead.
+
+### Chat and tasks — 2026-09-29
+
+Built: `src/chat/model.ts` (document + pure helpers), `transport.ts` (second PartyKit room),
+`ChatPanel.tsx` (UI), wired into `BoardView`. Messages, threads, reactions, `@mentions`, soft delete,
+per-message anchoring to a board node, and a task list with assignment — all CRDT-backed.
+
+Four decisions that a later reader should not undo:
+
+- **A separate `Y.Doc` and PartyKit room per board.** Chat volume would otherwise rewrite the board
+  document on every message, forcing a full board re-projection and growing the board's snapshot for
+  changes nobody is looking at on the canvas. The two share a team, a roster and a transport — not a
+  document.
+- **Messages are a `Y.Map`, not a `Y.Array`.** Yjs sequences handle concurrent *appends* fine, but
+  edit, delete and threading all need stable identity and a sequence gives positional identity.
+  Ordered by `(createdAt, id)`; the id tiebreak makes the order total, so same-millisecond posts do
+  not swap places between renders.
+- **Deletion is a bare `deleted: true`, and the body is deliberately left in the document.** An
+  earlier version also cleared the body, and a test caught the consequence: clearing `body` writes
+  the *same key* a collaborator's concurrent edit writes, so Yjs resolves them last-writer-wins and
+  the text reappears on one replica. A flag on its own key cannot lose that race. The trade is that
+  the text stays in the CRDT — deletion governs what is *shown*. If true erasure is ever wanted, that
+  is a deliberate data-deletion feature with an audit trail, not a side effect of a delete button.
+- **Identity is local and self-declared for now**, persisted in `localStorage` so your name and
+  colour survive reloads. Real accounts are listed as unbuilt below; the upgrade touches one
+  function (`localIdentity`) plus the roster.
+
+Two bugs found by writing the tests, both of which would have shipped:
+
+- A class field named `undo` shadowed the `undo()` *method*, so `chat.undo()` threw "not a function"
+  while `canUndo` still reported `true`. It looked wired up and was not.
+- The mention regex was greedy: in `"hey @Alice look"` it captured `"Alice look"`, which resolved to
+  nobody, so mentions silently stopped working as soon as anyone typed a word after the name. The
+  matcher is now built from the actual roster, which also makes multi-word names work.
+
+Not verified in a browser — the panel is TypeScript-clean and its document model is covered by
+`test/chat.test.ts` (42 cases, including two-replica convergence), but no Playwright check has
+driven the UI. Treat the panel as unproven until one does.
 
 ## Known gaps, carried forward
 
